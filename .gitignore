@@ -1,0 +1,13 @@
+build/
+builddir/
+*.o
+*.a
+*.dSYM/
+compile_commands.json
+.cache/
+.DS_Store
+
+# third-party sources fetched by Meson (the .wrap and packagefiles are what we keep)
+subprojects/packagecache/
+subprojects/libpg_query-*/
+subprojects/.wraplock
