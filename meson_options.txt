@@ -1,0 +1,6 @@
+option(
+  'fuzzer',
+  type : 'feature',
+  value : 'disabled',
+  description : 'Also build fuzz_libfuzzer, the fuzz targets linked with libFuzzer (needs a compiler that ships it, which Apple clang does not)',
+)

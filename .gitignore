@@ -11,3 +11,4 @@ compile_commands.json
 subprojects/packagecache/
 subprojects/libpg_query-*/
 subprojects/.wraplock
+build-asan/
