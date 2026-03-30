@@ -1,0 +1,1 @@
+select * from a join b.c on true where exists (select 1 from d)

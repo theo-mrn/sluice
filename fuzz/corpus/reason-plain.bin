@@ -1,0 +1,1 @@
+sluice: blocked by rule no-ddl: schema changes go through migrations

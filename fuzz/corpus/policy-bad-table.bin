@@ -1,0 +1,4 @@
+[[rule]]
+name = "x"
+match = "any"
+tables = ["a.b.c"]

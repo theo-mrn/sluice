@@ -1,0 +1,1 @@
+set role admin; set application_name = 'x'; reset all

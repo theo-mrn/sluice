@@ -1,0 +1,13 @@
+# comment
+mode = 'enforce'
+on_uninspectable = "allow"
+[[rule]]
+name = "a.b:c-d_e"
+match = "ddl"
+action = "allow"
+users = ["x", 'y',]
+databases = ["prod"]
+message = "ok"
+[[rule]]
+name = "z"
+match = "multi_statement"

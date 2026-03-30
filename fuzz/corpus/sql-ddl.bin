@@ -1,0 +1,1 @@
+create table t (i int); drop table t; truncate t

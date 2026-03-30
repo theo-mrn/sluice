@@ -1,0 +1,15 @@
+mode = "enforce"
+[[rule]]
+name = "agent-sales-only"
+match = "any"
+users = ["agent"]
+outside_tables = ["orders", "public.products"]
+[[rule]]
+name = "ledger"
+match = "not_read_only"
+tables = ["ledger", "archive.ledger"]
+[[rule]]
+name = "scratch"
+match = "ddl"
+action = "allow"
+tables = ["scratch"]

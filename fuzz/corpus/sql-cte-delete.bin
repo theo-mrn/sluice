@@ -1,0 +1,1 @@
+with d as (delete from t returning *) select * from d

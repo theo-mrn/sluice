@@ -1,0 +1,2 @@
+select * from a; delete from b where x = 1;
+  update c set y = 2 where z = 3 ; select 1

@@ -1,0 +1,1 @@
+copy (delete from t returning *) to stdout

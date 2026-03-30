@@ -1,0 +1,1 @@
+explain analyze update t set a = 1

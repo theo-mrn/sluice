@@ -1,0 +1,4 @@
+mode = "audit"
+[[rule]]
+name = "a"
+match = "drop"

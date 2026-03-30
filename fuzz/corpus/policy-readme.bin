@@ -1,0 +1,11 @@
+mode = "audit"
+
+[[rule]]
+name    = "no-unbounded-write"
+match   = "update_or_delete_without_where"
+message = "add a WHERE clause"
+
+[[rule]]
+name  = "agent-read-only"
+match = "not_read_only"
+users = ["agent"]

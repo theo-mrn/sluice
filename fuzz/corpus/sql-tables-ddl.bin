@@ -1,0 +1,1 @@
+create table x (i int); drop table y, z; comment on table x is 'c'
