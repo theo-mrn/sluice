@@ -1,0 +1,32 @@
+# VERDICT [RULE] [as USER[@DB]] :: SQL      (see src/testpolicy.h)
+as agent
+at 2026-11-17T10:00Z
+
+allow :: select 1
+allow :: update t set a = 1 where id = 1
+deny no-escalation :: set role admin
+deny no-escalation :: select set_config('role', 'admin', false)
+kill no-danger :: select pg_read_file('/etc/passwd')
+kill no-danger :: delete from t where id = 1 returning pg_sleep(1)
+allow :: copy t to stdout
+kill no-danger :: copy t to program 'sh'
+alert honeypot :: select * from internal_secrets
+deny no-ddl :: drop table t
+confirm confirm-deletes :: delete from t where id < 100
+dry trying-no-update-without-where :: update t set a = 1
+uninspectable :: select (
+
+# at night the agent does not write; somebody else may
+at 2026-11-17T23:30Z
+deny writes-in-working-hours :: update t set a = 1 where id = 1
+allow :: select 1
+allow as dba :: update t set a = 1 where id = 1
+
+# the migration window of one evening
+as migrator
+at 2026-12-01T17:59Z
+deny no-ddl :: create table x (a int)
+at 2026-12-01T18:30Z
+allow :: create table x (a int)
+at 2026-12-01T20:00Z
+deny no-ddl :: create table x (a int)

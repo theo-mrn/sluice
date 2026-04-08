@@ -1,0 +1,48 @@
+# The policy of docs/policy.md's examples, as code: tests/policies/example.tests says what it must do.
+mode = "enforce"
+
+[[rule]]
+name = "no-escalation"
+match = "set_session"
+users = ["agent"]
+
+[[rule]]
+name = "no-danger"
+match = "dangerous"
+action = "kill"
+
+[[rule]]
+name = "honeypot"
+match = "any"
+action = "alert"
+tables = ["internal_secrets"]
+
+[[rule]]
+name = "writes-in-working-hours"
+match = "not_read_only"
+users = ["agent"]
+except_during = ["mon-fri 08:00-19:00"]
+message = "writes during working hours only"
+
+[[rule]]
+name = "migration-window"
+match = "ddl"
+action = "allow"
+users = ["migrator"]
+valid_from = "2026-12-01T18:00Z"
+valid_until = "2026-12-01T20:00Z"
+
+[[rule]]
+name = "no-ddl"
+match = "ddl"
+
+[[rule]]
+name = "confirm-deletes"
+match = "delete"
+action = "confirm"
+over_rows = "5"
+
+[[rule]]
+name = "trying-no-update-without-where"
+match = "update_or_delete_without_where"
+dry_run = "on"
