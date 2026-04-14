@@ -26,7 +26,14 @@ enum {
     SL_SQL_TABLES_UNSEEN = 1u
         << 7,                /* the tables this statement touches cannot be known (see below) */
     SL_SQL_DELETE = 1u << 8, /* a DELETE (also when it is hidden inside another statement) */
-    SL_SQL_UPDATE = 1u << 9  /* an UPDATE (likewise) */
+    SL_SQL_UPDATE = 1u << 9, /* an UPDATE (likewise) */
+    SL_SQL_SET_SESSION = 1u << 10, /* SET ROLE, SET SESSION AUTHORIZATION, or a call to
+                                      set_config(): changes what the session may do. The call is
+                                      only known when the functions were listed (below). */
+    SL_SQL_DANGEROUS = 1u << 11 /* COPY from or to a file or a program, or a call to a function that
+                                   reads files, runs on other servers, sleeps, stops backends...
+                                   (the list is in policy.c). Calls are only known when the
+                                   functions were listed. */
 };
 
 /* Tables. For a rule that talks about tables, sluice needs to know which ones a statement touches.
@@ -53,6 +60,11 @@ typedef struct {
 typedef struct {
     sl_sql_table *items;
     size_t count;
+    /* the functions the statement calls, as the parser reports them (schema "" when none was
+     * written; a function inside a view, a function or a trigger is not seen). Filled with the
+     * tables. */
+    sl_sql_table *funcs;
+    size_t nfuncs;
 } sl_sql_tables;
 
 typedef struct {
@@ -60,11 +72,20 @@ typedef struct {
     size_t *group;   /* for each of them, the statement of the message it comes from (0-based) */
     size_t count;
     size_t top_level; /* statements written in the message */
-    /* When the message is one statement: 'D' if it is a DELETE, 'U' if it is an UPDATE, else 0; and
-     * whether it has a RETURNING of its own. */
+    /* When the message is one statement: 'D' if it is a DELETE, 'U' if it is an UPDATE, 'T' for a
+     * TRUNCATE, 'R' for a DROP of tables, views, indexes and the like (not of a database or a
+     * role), else 0; and whether it has a RETURNING of its own (for T and R: 1, there is nothing to
+     * add to them). */
     uint8_t top_kind;
     int top_returning;
+    /* the table a DELETE (top_kind 'D') deletes from, as written: schema (empty when none) and
+     * name; both empty when it cannot be said (a name over 63 bytes) */
+    char top_schema[64];
+    char top_table[64];
     sl_sql_tables *tables; /* the tables of each statement of the message; NULL unless asked for */
+    /* the shape of the message, as the log gives it (16 hex digits): the same for the same query
+     * whatever its values. Only filled together with the tables; empty when it cannot be had. */
+    char fingerprint[17];
 } sl_sql_info;
 
 /* Returns 0 and fills *out (release it with sl_sql_info_free), or -1 with a message in err when the

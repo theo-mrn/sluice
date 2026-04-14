@@ -8,6 +8,8 @@
 #define DRP SL_SQL_DROP
 #define TRN SL_SQL_TRUNCATE
 #define NRO SL_SQL_NOT_READ_ONLY
+#define SSN SL_SQL_SET_SESSION
+#define DNG SL_SQL_DANGEROUS
 #define PRC SL_SQL_PROCEDURAL
 #define MUL SL_SQL_MULTI
 #define UNS SL_SQL_TABLES_UNSEEN
@@ -112,6 +114,10 @@ static void test_data(void)
     EXPECT("copy (delete from t returning *) to stdout", NRO, NRO | UW);
     EXPECT("copy t from stdin", NRO);
     EXPECT("copy t to stdout", NRO);
+    EXPECT("copy t to '/tmp/x'", NRO | DNG);
+    EXPECT("copy t from '/etc/passwd'", NRO | DNG);
+    EXPECT("copy t to program 'ls'", NRO | DNG);
+    EXPECT("copy (select 1) to program 'ls'", NRO | DNG, 0);
 }
 
 static void test_schema(void)
@@ -171,9 +177,11 @@ static void test_session(void)
     EXPECT("set transaction isolation level serializable", 0);
     EXPECT("set session characteristics as transaction read only", 0);
     EXPECT("reset all", 0);
-    EXPECT("set role admin", NRO);
+    EXPECT("set role admin", NRO | SSN);
+    EXPECT("set local role admin", NRO | SSN);
+    EXPECT("set role none", NRO | SSN);
     EXPECT("reset role", NRO);
-    EXPECT("set session authorization joe", NRO);
+    EXPECT("set session authorization joe", NRO | SSN);
     EXPECT("set session_replication_role = replica", NRO);
 
     EXPECT("do $$ begin delete from t; end $$", PRC | NRO | UNS);
@@ -234,6 +242,58 @@ static void tables_are(int line, const char *sql, const char *want)
 }
 
 #define TABLES(sql, want) tables_are(__LINE__, (sql), (want))
+
+/* The functions a message calls, as "schema.name" or "name" (statements joined by ;). */
+static void funcs_are(int line, const char *sql, const char *want)
+{
+    sl_sql_info info;
+    char err[256];
+    char got[512] = "";
+    size_t used = 0;
+
+    if (sl_sql_classify_with_tables(sql, strlen(sql), &info, err, sizeof err) != 0) {
+        fprintf(stderr, "test_sql_check.c:%d: \"%s\" was refused: %s\n", line, sql, err);
+        sl_test_failures++;
+        return;
+    }
+    for (size_t g = 0; g < info.top_level; g++) {
+        if (g > 0) {
+            used += (size_t)snprintf(got + used, sizeof got - used, ";");
+        }
+        for (size_t t = 0; t < info.tables[g].nfuncs; t++) {
+            const sl_sql_table *f = &info.tables[g].funcs[t];
+
+            used += (size_t)snprintf(got + used, sizeof got - used, "%s%s%s%s", t ? "," : "",
+                                     f->schema, f->schema[0] ? "." : "", f->name);
+        }
+    }
+    if (strcmp(got, want) != 0) {
+        fprintf(stderr, "test_sql_check.c:%d: \"%s\"\n  functions: %s\n  want:      %s\n", line,
+                sql, got, want);
+        sl_test_failures++;
+    }
+    sl_sql_info_free(&info);
+}
+
+#define FUNCS(sql, want) funcs_are(__LINE__, (sql), (want))
+
+static void test_functions(void)
+{
+    FUNCS("select 1", "");
+    FUNCS("select pg_read_file('/etc/passwd')", "pg_read_file");
+    FUNCS("select pg_catalog.pg_sleep(1)", "pg_catalog.pg_sleep");
+    FUNCS("select set_config('role', 'x', false), lower('A')", "set_config,lower");
+    FUNCS("select * from t where id = (select max(id) from u)", "max");
+    FUNCS("select * from generate_series(1, 3)", "generate_series");
+    FUNCS("update t set a = nextval('s') where b = abs(-1)", "nextval,abs");
+    FUNCS("with d as (delete from t returning dblink_exec('x','y')) select 1", "dblink_exec");
+    FUNCS("delete from t returning pg_sleep(1)", "pg_sleep");
+    FUNCS("declare c cursor for select pg_read_file('x')", "pg_read_file");
+    FUNCS("create table x (a int default nextval('s'))", "nextval");
+    FUNCS("select 'FuncCall pg_sleep'", "");                          /* a string says nothing */
+    FUNCS("select \"\"\"FuncCall\"\":{\"\"funcname\"\":[\"\"\"", ""); /* nor does a name */
+    FUNCS("select 1; select pg_sleep(1)", ";pg_sleep");
+}
 
 static void test_tables(void)
 {
@@ -671,8 +731,30 @@ static void test_kinds(void)
         {"with x as (select 1) delete from t using x", SL_SQL_DELETE, 'D', 0},
         {"select 1", 0, 0, 0},
         {"insert into t values (1)", 0, 0, 0},
-        {"truncate t", 0, 0, 0},
-        {"merge into t using s on true when matched then delete", 0, 0, 0},
+        {"truncate t", 0, 'T', 1},
+        {"truncate table a, b restart identity cascade", 0, 'T', 1},
+        {"drop table t", 0, 'R', 1},
+        {"drop table if exists a, b cascade", 0, 'R', 1},
+        {"drop index i", 0, 'R', 1},
+        {"drop view v", 0, 'R', 1},
+        {"drop database d", 0, 0, 0}, /* cannot run in a transaction, nor be undone */
+        {"drop role r", 0, 0, 0},
+        {"drop table a; drop table b", 0, 0, 0}, /* two statements: no kind */
+        {"merge into t using s on true when matched then delete", SL_SQL_DELETE, 'M', 0},
+        {"merge into t using s on true when matched then update set a = 1", SL_SQL_UPDATE, 'M', 0},
+        {"merge into t using s on true when matched and s.x then update set a = 1 when not matched "
+         "then insert values (1) when matched then delete",
+         SL_SQL_UPDATE | SL_SQL_DELETE, 'M', 0},
+        {"merge into t using s on true when not matched then insert values (1)", 0, 'M', 0},
+        {"merge into t using s on true when matched then do nothing", 0, 'M', 0},
+        {"merge into t using s on true when matched then delete returning merge_action(), t.*",
+         SL_SQL_DELETE, 'M', 1},
+        {"insert into t values (1) on conflict (id) do update set a = 1", SL_SQL_UPDATE, 'I', 0},
+        {"insert into t values (1) on conflict (id) do update set a = 1 returning id",
+         SL_SQL_UPDATE, 'I', 1},
+        {"insert into t values (1) on conflict do nothing", 0, 0, 0},
+        {"insert into t values (1) on conflict (id) do update set a = 1; select 1", SL_SQL_UPDATE,
+         0, 0},                                                /* two statements: no kind */
         {"delete from t; delete from u", SL_SQL_DELETE, 0, 0}, /* two statements: no kind */
     };
 
@@ -689,6 +771,33 @@ static void test_kinds(void)
             sl_test_failures++;
         }
         sl_sql_info_free(&info);
+    }
+
+    /* the table a DELETE or an UPDATE writes to */
+    {
+        static const struct {
+            const char *sql, *schema, *table;
+        } t[] = {
+            {"delete from users", "", "users"},
+            {"delete from public.users where id = 1", "public", "users"},
+            {"delete from only \"Odd Name\" as o using other x where o.id = x.id", "", "Odd Name"},
+            {"delete from s.t returning *", "s", "t"},
+            {"update t set a = 1", "", "t"},
+            {"update only s.t as x set a = 1 from o where o.id = x.id returning x.a", "s", "t"}};
+
+        for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+            CHECK(sl_sql_classify(t[i].sql, strlen(t[i].sql), &info, err, sizeof err) == 0);
+            CHECK(strcmp(info.top_schema, t[i].schema) == 0 &&
+                  strcmp(info.top_table, t[i].table) == 0);
+            sl_sql_info_free(&info);
+        }
+        {
+            const char *sql = "insert into t values (1)"; /* no table is named for the others */
+
+            CHECK(sl_sql_classify(sql, strlen(sql), &info, err, sizeof err) == 0);
+            CHECK(info.top_table[0] == '\0');
+            sl_sql_info_free(&info);
+        }
     }
 
     /* a DELETE hidden in a CTE has its flag, and the message is not "a DELETE" as a whole */
@@ -746,6 +855,7 @@ int main(void)
     test_session();
     test_messages_with_several_statements();
     test_tables();
+    test_functions();
     test_unseen();
     test_redaction();
     test_refusals_and_limits();

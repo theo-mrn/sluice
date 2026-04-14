@@ -305,10 +305,18 @@ static void classify_node(collector *c, const pg_query_Node *node, int depth)
 
     switch (pg_query_Node_node_case(node)) {
     /* ---- data ---- */
-    case pg_query_Node_node_insert_stmt:
-        ADD(SL_SQL_NOT_READ_ONLY);
-        visit_with(c, pg_query_InsertStmt_with_clause(pg_query_Node_insert_stmt(node)), depth);
+    case pg_query_Node_node_insert_stmt: {
+        const pg_query_InsertStmt *s = pg_query_Node_insert_stmt(node);
+        const pg_query_OnConflictClause *oc = pg_query_InsertStmt_on_conflict_clause(s);
+
+        /* ON CONFLICT DO UPDATE changes rows that are there: for a rule it is an UPDATE */
+        ADD(SL_SQL_NOT_READ_ONLY |
+            (oc != NULL && pg_query_OnConflictClause_action(oc) == pg_query_ONCONFLICT_UPDATE
+                 ? SL_SQL_UPDATE
+                 : 0));
+        visit_with(c, pg_query_InsertStmt_with_clause(s), depth);
         return;
+    }
     case pg_query_Node_node_update_stmt: {
         const pg_query_UpdateStmt *s = pg_query_Node_update_stmt(node);
 
@@ -325,10 +333,29 @@ static void classify_node(collector *c, const pg_query_Node *node, int depth)
         visit_with(c, pg_query_DeleteStmt_with_clause(s), depth);
         return;
     }
-    case pg_query_Node_node_merge_stmt:
-        ADD(SL_SQL_NOT_READ_ONLY);
-        visit_with(c, pg_query_MergeStmt_with_clause(pg_query_Node_merge_stmt(node)), depth);
+    case pg_query_Node_node_merge_stmt: {
+        const pg_query_MergeStmt *s = pg_query_Node_merge_stmt(node);
+        size_t nwhen = 0;
+        const pg_query_Node *const *when = pg_query_MergeStmt_merge_when_clauses(s, &nwhen);
+        uint32_t flags = SL_SQL_NOT_READ_ONLY;
+
+        /* a MERGE is what its WHEN clauses do: an UPDATE, a DELETE, or both */
+        for (size_t i = 0; i < nwhen; i++) {
+            if (pg_query_Node_node_case(when[i]) == pg_query_Node_node_merge_when_clause) {
+                int32_t cmd =
+                    pg_query_MergeWhenClause_command_type(pg_query_Node_merge_when_clause(when[i]));
+
+                flags |= cmd == pg_query_CMD_UPDATE ? SL_SQL_UPDATE : 0;
+                flags |= cmd == pg_query_CMD_DELETE ? SL_SQL_DELETE : 0;
+            } else {
+                flags |=
+                    SL_SQL_UPDATE | SL_SQL_DELETE; /* not what was expected: assume the worst */
+            }
+        }
+        ADD(flags);
+        visit_with(c, pg_query_MergeStmt_with_clause(s), depth);
         return;
+    }
     case pg_query_Node_node_select_stmt: {
         const pg_query_SelectStmt *s = pg_query_Node_select_stmt(node);
 
@@ -338,8 +365,13 @@ static void classify_node(collector *c, const pg_query_Node *node, int depth)
     }
     case pg_query_Node_node_copy_stmt: {
         const pg_query_Node *q = pg_query_CopyStmt_query(pg_query_Node_copy_stmt(node));
+        const pg_query_CopyStmt *cs = pg_query_Node_copy_stmt(node);
 
-        ADD(SL_SQL_NOT_READ_ONLY);
+        /* a file on the server, or a program: not STDIN or STDOUT */
+        ADD(SL_SQL_NOT_READ_ONLY |
+            (pg_query_CopyStmt_is_program(cs) || pg_query_CopyStmt_filename(cs).size > 0
+                 ? SL_SQL_DANGEROUS
+                 : 0));
         if (q != NULL) {
             classify_node(c, q, depth + 1); /* COPY (DELETE ... RETURNING *) TO STDOUT */
         }
@@ -389,9 +421,14 @@ static void classify_node(collector *c, const pg_query_Node *node, int depth)
     case pg_query_Node_node_variable_set_stmt: {
         const pg_query_VariableSetStmt *s = pg_query_Node_variable_set_stmt(node);
 
-        if (pg_query_VariableSetStmt_kind(s) == pg_query_VAR_RESET_ALL ||
-            set_is_harmless(pg_query_VariableSetStmt_name(s))) {
+        upb_StringView nm = pg_query_VariableSetStmt_name(s);
+
+        if (pg_query_VariableSetStmt_kind(s) == pg_query_VAR_RESET_ALL || set_is_harmless(nm)) {
             ADD(0);
+        } else if (pg_query_VariableSetStmt_kind(s) != pg_query_VAR_RESET &&
+                   (sv_eq_nocase(nm, "role") || sv_eq_nocase(nm, "session_authorization"))) {
+            ADD(SL_SQL_NOT_READ_ONLY | SL_SQL_SET_SESSION); /* (SET ROLE and SET SESSION
+                                                               AUTHORIZATION, LOCAL or not) */
         } else {
             ADD(SL_SQL_NOT_READ_ONLY);
         }
@@ -535,8 +572,134 @@ static void free_tables(sl_sql_tables *t)
         free(t->items[i].schema);
         free(t->items[i].name);
     }
+    for (size_t i = 0; i < t->nfuncs; i++) {
+        free(t->funcs[i].schema);
+        free(t->funcs[i].name);
+    }
     free(t->items);
+    free(t->funcs);
     memset(t, 0, sizeof *t);
+}
+
+/* ---- functions ----
+ *
+ * The parser's own summary leaves out the calls in a RETURNING list, in DECLARE CURSOR and in the
+ * defaults of a table. The tree it parses is complete, so the calls are taken from the JSON of
+ * the whole tree: every FuncCall, wherever it sits, starts with its name as a list of strings
+ * ("funcname":[{"String":{"sval":"pg_catalog"}},{"String":{"sval":"pg_sleep"}}]). A string literal
+ * of the SQL cannot make one up (its quotes are escaped in the JSON), and one that did could only
+ * add a name to the list. What cannot be seen: a function body, a DO block, a view. */
+
+static int add_func(sl_sql_tables *t, const char *schema, size_t sl, const char *name, size_t nl)
+{
+    sl_sql_table *n;
+
+    for (size_t i = 0; i < t->nfuncs; i++) { /* once each */
+        if (strlen(t->funcs[i].name) == nl && memcmp(t->funcs[i].name, name, nl) == 0 &&
+            strlen(t->funcs[i].schema) == sl && memcmp(t->funcs[i].schema, schema, sl) == 0) {
+            return 0;
+        }
+    }
+    n = realloc(t->funcs, (t->nfuncs + 1) * sizeof *n);
+    if (n == NULL) {
+        return -1;
+    }
+    t->funcs = n;
+    n = &t->funcs[t->nfuncs];
+    n->schema = malloc(sl + 1);
+    n->name = malloc(nl + 1);
+    if (n->schema == NULL || n->name == NULL) {
+        free(n->schema);
+        free(n->name);
+        return -1;
+    }
+    memcpy(n->schema, schema, sl);
+    n->schema[sl] = '\0';
+    memcpy(n->name, name, nl);
+    n->name[nl] = '\0';
+    t->nfuncs++;
+    return 0;
+}
+
+/* One string of the JSON starting after its opening quote: its end (the closing quote), with the
+ * escapes undone into out (at most cap-1 bytes). NULL when there is none or it does not fit. */
+static const char *json_sval(const char *p, char *out, size_t cap)
+{
+    size_t n = 0;
+
+    for (; *p != '\0' && *p != '"'; p++) {
+        char ch = *p;
+
+        if (ch == '\\') {
+            p++;
+            if (*p == '\0') {
+                return NULL;
+            }
+            ch = *p == 'n' ? '\n' : *p == 't' ? '\t' : *p; /* the names that matter have none */
+        }
+        if (n + 1 >= cap) {
+            return NULL;
+        }
+        out[n++] = ch;
+    }
+    out[n] = '\0';
+    return *p == '"' ? p : NULL;
+}
+
+static int collect_functions(const char *sql, sl_sql_tables *out, char *err, size_t errcap)
+{
+    PgQueryParseResult r = pg_query_parse(sql);
+    const char *p;
+    int rc = 0;
+
+    if (r.error != NULL || r.parse_tree == NULL) {
+        snprintf(err, errcap, "cannot read the list of functions");
+        pg_query_free_parse_result(r);
+        return -1;
+    }
+    for (p = r.parse_tree; (p = strstr(p, "\"FuncCall\":{\"funcname\":[")) != NULL;) {
+        char names[4][130];
+        size_t nn = 0;
+
+        p += strlen("\"FuncCall\":{\"funcname\":[");
+        while (*p == '{') {
+            const char *q = strstr(p, "\"sval\":\"");
+            char one[130];
+
+            if (q == NULL) {
+                break;
+            }
+            q += strlen("\"sval\":\"");
+            q = json_sval(q, one, sizeof one);
+            if (q == NULL) {
+                break;
+            }
+            if (nn < 4) {
+                memcpy(names[nn++], one, sizeof one);
+            }
+            p = q;
+            while (*p != '\0' && *p != '}') { /* the end of the String node, then of its wrapper */
+                p++;
+            }
+            for (int close = 0; close < 2 && *p == '}'; close++) {
+                p++;
+            }
+            if (*p == ',') {
+                p++;
+            }
+        }
+        if (nn > 0 &&
+            add_func(out, nn >= 2 ? names[nn - 2] : "", nn >= 2 ? strlen(names[nn - 2]) : 0,
+                     names[nn - 1], strlen(names[nn - 1])) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+    if (rc != 0) {
+        snprintf(err, errcap, "out of memory");
+    }
+    pg_query_free_parse_result(r);
+    return rc;
 }
 
 /* The tables the parser reports for one statement (text is not NUL terminated). */
@@ -557,6 +720,11 @@ static int summarize(const char *text, size_t len, sl_sql_tables *out, char *err
     memcpy(sql, text, len);
     sql[len] = '\0';
     r = pg_query_summary(sql, 0, -1);
+    if (r.error == NULL && collect_functions(sql, out, err, errcap) != 0) {
+        free(sql);
+        pg_query_free_summary_parse_result(r);
+        return -1;
+    }
     free(sql);
     if (r.error != NULL) {
         snprintf(err, errcap, "%s", r.error->message ? r.error->message : "parse error");
@@ -714,6 +882,42 @@ static ambig_result string_is_ambiguous(const char *text, size_t len)
 
 /* ---- entry points ---- */
 
+/* The table a DELETE or an UPDATE writes to, as written (schema and name), when it fits. */
+static void name_relation(sl_sql_info *out, const pg_query_RangeVar *rv)
+{
+    if (rv != NULL) {
+        upb_StringView sch = pg_query_RangeVar_schemaname(rv);
+        upb_StringView rel = pg_query_RangeVar_relname(rv);
+
+        if (sch.size < sizeof out->top_schema && rel.size < sizeof out->top_table && rel.size > 0) {
+            if (sch.size > 0) { /* (data is NULL when there is no schema) */
+                memcpy(out->top_schema, sch.data, sch.size);
+            }
+            memcpy(out->top_table, rel.data, rel.size);
+        }
+    }
+}
+
+/* The fingerprint of a message (16 hex digits), or "" when it cannot be had. */
+static void fingerprint_of(const char *sql, size_t len, char out[17])
+{
+    char *copy = malloc(len + 1);
+    PgQueryFingerprintResult fr;
+
+    out[0] = '\0';
+    if (copy == NULL) {
+        return;
+    }
+    memcpy(copy, sql, len);
+    copy[len] = '\0';
+    fr = pg_query_fingerprint(copy);
+    free(copy);
+    if (fr.error == NULL && fr.fingerprint_str != NULL && strlen(fr.fingerprint_str) == 16) {
+        memcpy(out, fr.fingerprint_str, 17);
+    }
+    pg_query_free_fingerprint_result(fr);
+}
+
 static int classify(const char *sql, size_t len, int want_tables, sl_sql_info *out, char *err,
                     size_t errcap)
 {
@@ -777,13 +981,34 @@ static int classify(const char *sql, size_t len, int want_tables, sl_sql_info *o
             top_kind = 'D';
             top_returning =
                 pg_query_DeleteStmt_has_returning_clause(pg_query_Node_delete_stmt(top)) != 0;
+            name_relation(out, pg_query_DeleteStmt_relation(pg_query_Node_delete_stmt(top)));
         } else if (pg_query_Node_node_case(top) == pg_query_Node_node_update_stmt) {
             top_kind = 'U';
             top_returning =
                 pg_query_UpdateStmt_has_returning_clause(pg_query_Node_update_stmt(top)) != 0;
+            name_relation(out, pg_query_UpdateStmt_relation(pg_query_Node_update_stmt(top)));
+        } else if (pg_query_Node_node_case(top) == pg_query_Node_node_insert_stmt &&
+                   pg_query_InsertStmt_on_conflict_clause(pg_query_Node_insert_stmt(top)) != NULL &&
+                   pg_query_OnConflictClause_action(pg_query_InsertStmt_on_conflict_clause(
+                       pg_query_Node_insert_stmt(top))) == pg_query_ONCONFLICT_UPDATE) {
+            top_kind = 'I'; /* INSERT ... ON CONFLICT DO UPDATE */
+            top_returning =
+                pg_query_InsertStmt_has_returning_clause(pg_query_Node_insert_stmt(top)) != 0;
+        } else if (pg_query_Node_node_case(top) == pg_query_Node_node_merge_stmt) {
+            top_kind = 'M';
+            top_returning =
+                pg_query_MergeStmt_has_returning_clause(pg_query_Node_merge_stmt(top)) != 0;
+        } else if (pg_query_Node_node_case(top) == pg_query_Node_node_truncate_stmt) {
+            top_kind = 'T';
+            top_returning = 1; /* nothing to add: it is run as it is */
+        } else if (pg_query_Node_node_case(top) == pg_query_Node_node_drop_stmt) {
+            top_kind =
+                'R'; /* DROP TABLE, VIEW, INDEX...: not DROP DATABASE, which cannot be undone */
+            top_returning = 1;
         }
     }
     if (want_tables) {
+        fingerprint_of(sql, len, out->fingerprint);
         tables = calloc(n ? n : 1, sizeof *tables);
         if (tables == NULL) {
             c.oom = 1;
