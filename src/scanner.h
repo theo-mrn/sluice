@@ -17,6 +17,10 @@
  * What is done with each message:
  *   - Query ('Q') and Parse ('P') of at most inspect_max bytes: held until complete, then handed to
  *     ops->statement, which lets it through or supplies a message to send in its place.
+ *   - Bind, Describe, Execute, Close and Sync ('B' 'D' 'E' 'C' 'S', and 'F' when it is not judged)
+ *     are handed to ops->extended, when there is one, by their first SL_SCAN_PEEK bytes: the names
+ *     they carry are at the start, and a Bind can be megabytes long. Whatever it answers, the rest
+ * of the message is relayed or thrown away unread.
  *   - Query and Parse above inspect_max, and the fast-path call ('F') when judge_fastpath is set:
  * handed to ops->unreadable by their header alone; either they stream through unread, or their
  * header is replaced and the body is thrown away as it arrives.
@@ -33,6 +37,10 @@
 /* Bigger Query and Parse messages are not held to be read: 1 MiB bounds what a client can make us
  * keep. */
 #define SL_SCAN_INSPECT_MAX ((size_t)1 << 20)
+
+/* How much of the start of a Bind, Describe, Execute or Close is looked at: two names of at most 63
+ * bytes and their terminators fit. */
+#define SL_SCAN_PEEK ((size_t)136)
 
 typedef struct {
     size_t released;       /* bytes at the head of the queue that may be sent */
@@ -60,6 +68,9 @@ enum {
     /* Leave the message where it is and stop scanning until sl_scan_resume(); it is handed to the
      * callback again then. (The server still owes answers to what came before, for instance.) */
     SL_SCAN_WAIT = 3,
+    /* Throw the message away: the caller has answered the client itself, and the server never sees
+     * it (nothing is owed by the server for it). */
+    SL_SCAN_ANSWER = 4,
     SL_SCAN_FAIL = -1 /* out of memory */
 };
 
@@ -75,6 +86,13 @@ typedef struct {
     /* Returns non-zero to stop for good (sl_scan_run then returns SL_SCAN_CLOSE), zero to relay the
      * rest. */
     int (*frame_error)(void *ctx);
+    /* The start of a Bind, Describe, Execute, Close or Sync (or a fast-path call that is not
+     * judged): payload holds the first `len` bytes of a body that is `total` bytes long (len <
+     * total when only the start is here). It may answer RELAY, WAIT, BLOCK or GUARD like
+     * `statement`; what it puts in *replacement takes the place of the whole message. May be NULL.
+     */
+    int (*extended)(void *ctx, uint8_t type, const uint8_t *payload, size_t len, size_t total,
+                    sl_buf *replacement);
 } sl_scan_ops;
 
 enum {

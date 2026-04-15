@@ -409,8 +409,39 @@ static void test_sasl_offer(void)
     sl_buf_free(&out);
 }
 
+static void test_report_with_detail_and_hint(void)
+{
+    sl_buf b;
+    const char *text;
+
+    sl_buf_init(&b);
+    CHECK(sl_pg_append_report(&b, 'N', "NOTICE", "00000", "msg", "the detail", "the hint") == 0);
+    CHECK(sl_buf_data(&b)[0] == 'N');
+    CHECK(sl_pg_get_be32(sl_buf_data(&b) + 1) + 1 == sl_buf_len(&b));
+    text = (const char *)sl_buf_data(&b) + 5;
+    CHECK(memcmp(text, "SNOTICE", 8) == 0);
+    {
+        const char *all = (const char *)sl_buf_data(&b);
+        size_t n = sl_buf_len(&b);
+        int has_d = 0, has_h = 0;
+
+        for (size_t i = 5; i + 1 < n; i++) {
+            has_d |= memcmp(all + i, "Dthe detail", 11) == 0;
+            has_h |= memcmp(all + i, "Hthe hint", 9) == 0;
+        }
+        CHECK(has_d && has_h);
+        CHECK(all[n - 1] == 0 && all[n - 2] == 0);
+    }
+    sl_buf_free(&b);
+    sl_buf_init(&b);
+    CHECK(sl_pg_append_report(&b, 'E', "ERROR", "42501", "m", NULL, NULL) == 0);
+    CHECK(sl_buf_data(&b)[0] == 'E' && sl_pg_get_be32(sl_buf_data(&b) + 1) + 1 == sl_buf_len(&b));
+    sl_buf_free(&b);
+}
+
 int main(void)
 {
+    test_report_with_detail_and_hint();
     test_sasl_offer();
     test_failing_messages();
     test_statements();

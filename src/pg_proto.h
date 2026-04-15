@@ -143,6 +143,11 @@ int sl_pg_append_failing_parse(sl_buf *out, const char *name, size_t name_len, c
 
 /* Appends an ErrorResponse with the given severity ("FATAL", "ERROR"), SQLSTATE (5 characters, for
  * example "08006") and message. Returns 0, or -1 when out of memory or too long. */
+/* An ErrorResponse (type 'E') or a NoticeResponse (type 'N') with a detail and a hint (either may
+ * be NULL), as psql shows them: the message, then DETAIL and HINT lines. */
+int sl_pg_append_report(sl_buf *out, uint8_t type, const char *severity, const char *sqlstate,
+                        const char *message, const char *detail, const char *hint);
+
 int sl_pg_append_error(sl_buf *out, const char *severity, const char *sqlstate,
                        const char *message);
 

@@ -70,7 +70,7 @@ static int fake_frame_error(void *ctx)
     return f->close_on_frame_error;
 }
 
-static const sl_scan_ops ops = {fake_statement, fake_unreadable, fake_frame_error};
+static const sl_scan_ops ops = {fake_statement, fake_unreadable, fake_frame_error, NULL};
 
 /* Plays the connection: feeds `in` in reads of `chunk` bytes, sends what the scanner releases, and
  * at the end of the stream sends whatever is still held. Returns the last scanner result; `out`
@@ -380,7 +380,7 @@ static int guard_statement(void *ctx, uint8_t type, const uint8_t *payload, size
     return SL_SCAN_RELAY;
 }
 
-static const sl_scan_ops guard_ops = {guard_statement, fake_unreadable, fake_frame_error};
+static const sl_scan_ops guard_ops = {guard_statement, fake_unreadable, fake_frame_error, NULL};
 
 static void test_guard_wait_inject(void)
 {
@@ -475,7 +475,8 @@ static void test_guard_wait_inject(void)
     f.block_statements = 1;
     CHECK(sl_buf_append(&buf, in, n) == 0);
     {
-        static const sl_scan_ops blocking = {fake_statement, fake_unreadable, fake_frame_error};
+        static const sl_scan_ops blocking = {fake_statement, fake_unreadable, fake_frame_error,
+                                             NULL};
 
         CHECK(sl_scan_run(&s, &buf, &blocking, &f) == SL_SCAN_OK);
     }
@@ -496,6 +497,236 @@ static void test_guard_wait_inject(void)
     }
 }
 
+/* ---- the hook for Bind, Describe, Execute, Close and Sync ---- */
+
+typedef struct {
+    int calls;
+    int by_type[256];
+    size_t last_len;
+    size_t last_total;
+    uint8_t first_seen[8]; /* the first bytes of the last payload */
+    size_t first_seen_n;
+} ext_fake;
+
+static int ext_hook(void *ctx, uint8_t type, const uint8_t *payload, size_t len, size_t total,
+                    sl_buf *replacement)
+{
+    ext_fake *f = ctx;
+    uint8_t msg[32];
+    size_t n;
+
+    f->calls++;
+    f->by_type[type]++;
+    f->last_len = len;
+    f->last_total = total;
+    f->first_seen_n = len < sizeof f->first_seen ? len : sizeof f->first_seen;
+    memcpy(f->first_seen, payload, f->first_seen_n);
+    if (len > 0 && payload[0] == 'X') { /* refused: a failing message takes its place */
+        n = replacement_message(msg);
+        return sl_buf_append(replacement, msg, n) == 0 ? SL_SCAN_BLOCK : SL_SCAN_FAIL;
+    }
+    if (type == 'E' && len > 0 && payload[0] == 'G') { /* guarded: the Execute, then a Flush */
+        uint8_t buf[64];
+        size_t k = put(buf, 0, 'E', (const char *)payload, len);
+
+        k = put(buf, k, 'H', "", 0);
+        return sl_buf_append(replacement, buf, k) == 0 ? SL_SCAN_GUARD : SL_SCAN_FAIL;
+    }
+    return SL_SCAN_RELAY;
+}
+
+static const sl_scan_ops ext_ops = {fake_statement, fake_unreadable, fake_frame_error, ext_hook};
+
+static int drive_ext(const uint8_t *in, size_t n, size_t chunk, ext_fake *f, int fastpath,
+                     sl_scan *s, sl_buf *out)
+{
+    sl_buf buf;
+    size_t pos = 0;
+    int rc = SL_SCAN_OK;
+
+    sl_scan_init(s, fastpath, SL_SCAN_INSPECT_MAX);
+    sl_buf_init(&buf);
+    while (pos < n) {
+        size_t k = n - pos < chunk ? n - pos : chunk;
+
+        CHECK(sl_buf_append(&buf, in + pos, k) == 0);
+        pos += k;
+        rc = sl_scan_run(s, &buf, &ext_ops, f); /* only the hook is called with these streams */
+        CHECK(sl_buf_append(out, sl_buf_data(&buf), s->released) == 0);
+        sl_buf_consume(&buf, s->released);
+        s->released = 0;
+    }
+    sl_buf_free(&buf);
+    return rc;
+}
+
+static void test_extended_hook(void)
+{
+    static const size_t chunks[] = {1, 3, 7, 136, 100000};
+
+    for (size_t ci = 0; ci < sizeof chunks / sizeof chunks[0]; ci++) {
+        size_t chunk = chunks[ci];
+        uint8_t *in = malloc(400000);
+        size_t n = 0;
+        sl_scan s;
+        sl_buf out;
+        ext_fake f;
+        char big[300000];
+
+        CHECK(in != NULL);
+        /* a Bind of 300 kB: only its start is looked at, all of it goes through */
+        memset(big, 'z', sizeof big);
+        memcpy(big, "p1\0s1\0", 6);
+        memset(&f, 0, sizeof f);
+        n = put(in, 0, 'B', big, sizeof big);
+        n = put(in, n, 'S', "", 0);
+        sl_buf_init(&out);
+        CHECK(drive_ext(in, n, chunk, &f, 0, &s, &out) == SL_SCAN_OK);
+        CHECK(f.by_type['B'] == 1 && f.by_type['S'] == 1 && f.calls == 2);
+        CHECK(f.last_total == 0); /* the Sync */
+        CHECK(sl_buf_len(&out) == n);
+        CHECK_MEM(sl_buf_data(&out), in, n);
+        CHECK(s.owed == 1);
+        sl_buf_free(&out);
+
+        /* the start it is given is the same whatever the cut */
+        memset(&f, 0, sizeof f);
+        n = put(in, 0, 'B', big, sizeof big);
+        sl_buf_init(&out);
+        CHECK(drive_ext(in, n, chunk, &f, 0, &s, &out) == SL_SCAN_OK);
+        CHECK(f.calls == 1 && f.last_len == SL_SCAN_PEEK && f.last_total == sizeof big);
+        CHECK(memcmp(f.first_seen, "p1\0s1\0", 6) == 0);
+        sl_buf_free(&out);
+
+        /* a short Describe is whole */
+        memset(&f, 0, sizeof f);
+        n = put(in, 0, 'D', "Ps1\0", 4);
+        sl_buf_init(&out);
+        CHECK(drive_ext(in, n, chunk, &f, 0, &s, &out) == SL_SCAN_OK);
+        CHECK(f.last_len == 4 && f.last_total == 4 && sl_buf_len(&out) == n);
+        sl_buf_free(&out);
+
+        /* a refused Bind: the replacement goes, the whole body is thrown away, the next goes on */
+        memset(&f, 0, sizeof f);
+        big[0] = 'X';
+        n = put(in, 0, 'B', big, sizeof big);
+        n = put(in, n, 'C', "Ss1\0", 4);
+        sl_buf_init(&out);
+        CHECK(drive_ext(in, n, chunk, &f, 0, &s, &out) == SL_SCAN_OK);
+        {
+            uint8_t want[64];
+            size_t w = replacement_message(want);
+            uint8_t close_msg[16];
+            size_t cl = put(close_msg, 0, 'C', "Ss1\0", 4);
+
+            CHECK(sl_buf_len(&out) == w + cl);
+            CHECK_MEM(sl_buf_data(&out), want, w);
+            CHECK_MEM(sl_buf_data(&out) + w, close_msg, cl);
+        }
+        CHECK(f.by_type['B'] == 1 && f.by_type['C'] == 1);
+        sl_buf_free(&out);
+
+        /* a guarded Execute: it goes with a Flush behind it, then the scanner waits */
+        memset(&f, 0, sizeof f);
+        n = put(in, 0, 'E', "Gp\0\0\0\0\0", 7);
+        n = put(in, n, 'S', "", 0);
+        sl_buf_init(&out);
+        CHECK(drive_ext(in, n, chunk, &f, 0, &s, &out) == SL_SCAN_OK);
+        CHECK(s.paused == 1);
+        {
+            uint8_t want[64];
+            size_t w = put(want, 0, 'E', "Gp\0\0\0\0\0", 7);
+
+            w = put(want, w, 'H', "", 0);
+            CHECK(sl_buf_len(&out) == w);
+            CHECK_MEM(sl_buf_data(&out), want, w);
+        }
+        CHECK(f.by_type['S'] == 0 && s.owed == 0); /* the Sync is held behind it */
+        sl_buf_free(&out);
+
+        /* a fast-path call that is not judged goes to the hook, and owes an answer */
+        memset(&f, 0, sizeof f);
+        n = put(in, 0, 'F', "abcd", 4);
+        sl_buf_init(&out);
+        CHECK(drive_ext(in, n, chunk, &f, 0, &s, &out) == SL_SCAN_OK);
+        CHECK(f.by_type['F'] == 1 && s.owed == 1 && sl_buf_len(&out) == n);
+        sl_buf_free(&out);
+        free(in);
+    }
+}
+
+/* ---- SL_SCAN_ANSWER: the message is thrown away, the server never hears of it ---- */
+
+static int answer_statement(void *ctx, uint8_t type, const uint8_t *payload, size_t len,
+                            sl_buf *replacement)
+{
+    (void)ctx;
+    (void)type;
+    (void)replacement;
+    return len > 0 && payload[0] == 'A' ? SL_SCAN_ANSWER : SL_SCAN_RELAY;
+}
+
+static int answer_extended(void *ctx, uint8_t type, const uint8_t *payload, size_t len,
+                           size_t total, sl_buf *replacement)
+{
+    (void)ctx;
+    (void)type;
+    (void)total;
+    (void)replacement;
+    return len > 0 && payload[0] == 'A' ? SL_SCAN_ANSWER : SL_SCAN_RELAY;
+}
+
+static void test_answer(void)
+{
+    static const sl_scan_ops aops = {answer_statement, fake_unreadable, fake_frame_error,
+                                     answer_extended};
+    static const size_t chunks[] = {1, 3, 7, 100000};
+
+    for (size_t ci = 0; ci < sizeof chunks / sizeof chunks[0]; ci++) {
+        uint8_t in[512];
+        uint8_t want[512];
+        size_t n = 0;
+        size_t w = 0;
+        sl_scan s;
+        sl_buf buf;
+        sl_buf out;
+        fake f = {0};
+        size_t pos = 0;
+
+        /* a Query answered, a Query relayed, a long Bind answered, a Sync relayed */
+        n = put(in, n, 'Q', "Aselect 1\0", 10);
+        n = put(in, n, 'Q', "select 2\0", 9);
+        w = put(want, w, 'Q', "select 2\0", 9);
+        {
+            char big[300];
+
+            memset(big, 'x', sizeof big);
+            big[0] = 'A';
+            n = put(in, n, 'B', big, sizeof big);
+        }
+        n = put(in, n, 'S', "", 0);
+        w = put(want, w, 'S', "", 0);
+        sl_scan_init(&s, 0, SL_SCAN_INSPECT_MAX);
+        sl_buf_init(&buf);
+        sl_buf_init(&out);
+        while (pos < n) {
+            size_t k = n - pos < chunks[ci] ? n - pos : chunks[ci];
+
+            CHECK(sl_buf_append(&buf, in + pos, k) == 0);
+            pos += k;
+            CHECK(sl_scan_run(&s, &buf, &aops, &f) == SL_SCAN_OK);
+            CHECK(sl_buf_append(&out, sl_buf_data(&buf), s.released) == 0);
+            sl_buf_consume(&buf, s.released);
+            s.released = 0;
+        }
+        CHECK(sl_buf_len(&out) == w && memcmp(sl_buf_data(&out), want, w) == 0);
+        CHECK(s.owed ==
+              2); /* the relayed Query and the Sync: nothing is owed for what was answered */
+        sl_buf_free(&buf);
+        sl_buf_free(&out);
+    }
+}
+
 int main(void)
 {
     test_messages_pass();
@@ -505,5 +736,7 @@ int main(void)
     test_frame_errors();
     test_held_and_eof();
     test_guard_wait_inject();
+    test_extended_hook();
+    test_answer();
     return TEST_RESULT();
 }

@@ -302,26 +302,36 @@ static int append_field(sl_buf *out, char tag, const char *value)
     return sl_buf_append(out, value, strlen(value) + 1);
 }
 
-int sl_pg_append_error(sl_buf *out, const char *severity, const char *sqlstate, const char *message)
+int sl_pg_append_report(sl_buf *out, uint8_t type, const char *severity, const char *sqlstate,
+                        const char *message, const char *detail, const char *hint)
 {
-    size_t sev = strlen(severity) + 1;
-    size_t code = strlen(sqlstate) + 1;
-    size_t msg = strlen(message) + 1;
-    /* length field + S + V + C + M fields (1 tag byte each) + final terminator */
-    size_t length = 4 + (1 + sev) * 2 + (1 + code) + (1 + msg) + 1;
+    size_t length = 4 + (1 + strlen(severity) + 1) * 2 + (1 + strlen(sqlstate) + 1) +
+                    (1 + strlen(message) + 1) + 1;
     uint8_t head[5];
     const uint8_t zero = 0;
 
+    if (detail != NULL) {
+        length += 1 + strlen(detail) + 1;
+    }
+    if (hint != NULL) {
+        length += 1 + strlen(hint) + 1;
+    }
     if (length > SL_PG_MAX_MESSAGE_LEN) {
         return -1;
     }
-    head[0] = 'E';
+    head[0] = type;
     sl_pg_put_be32(head + 1, (uint32_t)length);
-
     if (sl_buf_append(out, head, sizeof head) != 0 || append_field(out, 'S', severity) != 0 ||
         append_field(out, 'V', severity) != 0 || append_field(out, 'C', sqlstate) != 0 ||
-        append_field(out, 'M', message) != 0 || sl_buf_append(out, &zero, 1) != 0) {
+        append_field(out, 'M', message) != 0 ||
+        (detail != NULL && append_field(out, 'D', detail) != 0) ||
+        (hint != NULL && append_field(out, 'H', hint) != 0) || sl_buf_append(out, &zero, 1) != 0) {
         return -1;
     }
     return 0;
+}
+
+int sl_pg_append_error(sl_buf *out, const char *severity, const char *sqlstate, const char *message)
+{
+    return sl_pg_append_report(out, 'E', severity, sqlstate, message, NULL, NULL);
 }

@@ -2,8 +2,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "check.h"
@@ -264,6 +267,167 @@ static void test_no_terminal_and_hangup(void)
     sl_prompt_free(p);
 }
 
+/* ---- a command instead of a terminal ---- */
+
+/* Waits (at most ms) until `want` answers have come, serving the prompt as the server loop would.
+ */
+static void pump_cmd(sl_prompt *p, replies *r, int want, int ms)
+{
+    for (int waited = 0; waited < ms && r->answers < want; waited += 10) {
+        struct pollfd pfd = {sl_prompt_fd(p), POLLIN, 0};
+
+        if (pfd.fd >= 0 && poll(&pfd, 1, 10) > 0) {
+            sl_prompt_readable(p);
+        }
+    }
+}
+
+static void tmp_path(char *out, size_t cap, const char *tag)
+{
+    const char *dir = getenv("TMPDIR");
+
+    snprintf(out, cap, "%s/sluice-prompt-%s-%d", dir != NULL && dir[0] ? dir : "/tmp", tag,
+             (int)getpid());
+    unlink(out);
+}
+
+static int file_has(const char *path, const char *text)
+{
+    char buf[512] = "";
+    FILE *f = fopen(path, "r");
+    size_t n;
+
+    if (f == NULL) {
+        return 0;
+    }
+    n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    return strstr(buf, text) != NULL;
+}
+
+static void test_command_answers(void)
+{
+    static const struct {
+        const char *cmd;
+        int yes;
+    } cases[] = {
+        {"cat > %s; exit 0", 1},
+        {"cat > %s; exit 1", 0},
+        {"cat > %s; exit 3", 0},
+        {"echo yes; echo y >&2; cat > %s; exit 1", 0}, /* what it prints is not the answer */
+        {"no-such-command-in-sluice-tests", 0}};
+    char file[256];
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        sl_prompt *p = sl_prompt_new(NULL);
+        replies r = {0};
+        char cmd[512];
+
+        tmp_path(file, sizeof file, "q");
+        snprintf(cmd, sizeof cmd, cases[i].cmd, file);
+        CHECK(sl_prompt_set_command(p, cmd) == 0);
+        CHECK(sl_prompt_ask(p, &r, "delete from t: 3 rows\ncommit? [y/N] ", got) == 0);
+        pump_cmd(p, &r, 1, 3000);
+        CHECK(r.answers == 1 && r.last == cases[i].yes);
+        if (strstr(cases[i].cmd, "cat >")) {
+            CHECK(file_has(file, "delete from t: 3 rows")); /* the question is its standard input */
+        }
+        CHECK(sl_prompt_fd(p) == -1);
+        sl_prompt_free(p);
+        unlink(file);
+    }
+}
+
+static void test_command_queue_and_cancel(void)
+{
+    sl_prompt *p = sl_prompt_new(NULL);
+    replies r = {0};
+    replies other = {0};
+    char pidfile[256];
+    char cmd[512];
+    int pid = 0;
+
+    /* questions are asked in turn */
+    CHECK(sl_prompt_set_command(p, "cat > /dev/null; exit 0") == 0);
+    CHECK(sl_prompt_ask(p, &r, "one ", got) == 0);
+    CHECK(sl_prompt_ask(p, &other, "two ", got) == 0);
+    pump_cmd(p, &r, 1, 3000);
+    pump_cmd(p, &other, 1, 3000);
+    CHECK(r.answers == 1 && r.last == 1 && other.answers == 1 && other.last == 1);
+    sl_prompt_free(p);
+
+    /* a command still running when the question is withdrawn is killed, and the next one goes on */
+    p = sl_prompt_new(NULL);
+    memset(&r, 0, sizeof r);
+    memset(&other, 0, sizeof other);
+    tmp_path(pidfile, sizeof pidfile, "pid");
+    snprintf(cmd, sizeof cmd, "echo $$ > %s; exec sleep 30", pidfile);
+    CHECK(sl_prompt_set_command(p, cmd) == 0);
+    CHECK(sl_prompt_ask(p, &r, "slow ", got) == 0);
+    for (int i = 0; i < 300 && pid == 0; i++) {
+        FILE *f = fopen(pidfile, "r");
+
+        if (f != NULL) {
+            if (fscanf(f, "%d", &pid) != 1) {
+                pid = 0;
+            }
+            fclose(f);
+        }
+        nanosleep(&(struct timespec){0, 10000000}, NULL);
+    }
+    CHECK(pid > 1 && kill(pid, 0) == 0);
+    sl_prompt_cancel(p, &r);
+    CHECK(r.answers == 0); /* withdrawn: no answer is given */
+    {
+        int gone = 0;
+
+        for (int i = 0; i < 300 && !gone; i++) {
+            gone = kill(pid, 0) != 0 && errno == ESRCH;
+            nanosleep(&(struct timespec){0, 10000000}, NULL);
+        }
+        CHECK(gone);
+    }
+    CHECK(sl_prompt_fd(p) == -1);
+    sl_prompt_free(p);
+    unlink(pidfile);
+
+    /* freeing the prompt with a command running ends it too */
+    p = sl_prompt_new(NULL);
+    pid = 0;
+    snprintf(cmd, sizeof cmd, "echo $$ > %s; exec sleep 30", pidfile);
+    CHECK(sl_prompt_set_command(p, cmd) == 0);
+    CHECK(sl_prompt_ask(p, &r, "slow ", got) == 0);
+    for (int i = 0; i < 300 && pid == 0; i++) {
+        FILE *f = fopen(pidfile, "r");
+
+        if (f != NULL) {
+            if (fscanf(f, "%d", &pid) != 1) {
+                pid = 0;
+            }
+            fclose(f);
+        }
+        nanosleep(&(struct timespec){0, 10000000}, NULL);
+    }
+    sl_prompt_free(p);
+    CHECK(pid > 1 && kill(pid, 0) != 0);
+    unlink(pidfile);
+}
+
+/* A command that starts something in the background and ends is answered when it ends, not when
+ * what it started does. */
+static void test_command_background(void)
+{
+    sl_prompt *p = sl_prompt_new(NULL);
+    replies r = {0};
+
+    CHECK(sl_prompt_set_command(p, "(sleep 3 >/dev/null 2>&1 &) ; exit 0") == 0);
+    CHECK(sl_prompt_ask(p, &r, "? ", got) == 0);
+    pump_cmd(p, &r, 1, 1500);
+    CHECK(r.answers == 1 && r.last == 1);
+    sl_prompt_free(p);
+}
+
 int main(void)
 {
     test_questions_in_turn();
@@ -272,5 +436,8 @@ int main(void)
     test_cancel();
     test_typed_before_the_question();
     test_no_terminal_and_hangup();
+    test_command_answers();
+    test_command_queue_and_cancel();
+    test_command_background();
     return TEST_RESULT();
 }

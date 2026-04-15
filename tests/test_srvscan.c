@@ -45,7 +45,7 @@ static int fake_message(void *ctx, uint8_t type, const uint8_t *payload, size_t 
     return type == f->drop_type ? SL_SRV_DROP : SL_SRV_KEEP;
 }
 
-static const sl_srv_ops ops = {fake_classify, fake_message};
+static const sl_srv_ops ops = {fake_classify, fake_message, NULL, NULL};
 
 static size_t put(uint8_t *out, size_t at, char type, const char *payload, size_t len)
 {
@@ -215,11 +215,97 @@ static void test_lost_framing(void)
     (void)f;
 }
 
+/* ---- passed() and SL_SRV_REPLACE ---- */
+
+typedef struct {
+    sl_srv *srv;
+    char passed[64];
+    int npassed;
+} rp;
+
+static int rp_classify(void *ctx, uint8_t type, size_t payload_len)
+{
+    (void)ctx;
+    (void)payload_len;
+    return type == 'T' ? SL_SRV_READ : SL_SRV_PASS;
+}
+
+static int rp_message(void *ctx, uint8_t type, const uint8_t *payload, size_t len)
+{
+    rp *r = ctx;
+
+    (void)type;
+    (void)payload;
+    (void)len;
+    /* a RowDescription becomes NoData */
+    CHECK(sl_buf_append(&r->srv->replacement, "n\0\0\0\4", 5) == 0);
+    return SL_SRV_REPLACE;
+}
+
+static void rp_passed(void *ctx, uint8_t type, size_t payload_len)
+{
+    rp *r = ctx;
+
+    (void)payload_len;
+    if (r->npassed < (int)sizeof r->passed - 1) {
+        r->passed[r->npassed] = (char)type;
+    }
+    r->npassed++;
+}
+
+static void test_replace_and_passed(void)
+{
+    static const sl_srv_ops rops = {rp_classify, rp_message, rp_passed, NULL};
+    uint8_t in[256];
+    uint8_t want[256];
+    size_t n = 0;
+    size_t w = 0;
+
+    n = put(in, n, '1', "", 0);
+    n = put(in, n, 'T', "\0\1name\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20);
+    n = put(in, n, 'D', "\0\1\0\0\0\1x", 7);
+    n = put(in, n, 'C', "SELECT 1\0", 9);
+    w = put(want, w, '1', "", 0);
+    w = put(want, w, 'n', "", 0);
+    w = put(want, w, 'D', "\0\1\0\0\0\1x", 7);
+    w = put(want, w, 'C', "SELECT 1\0", 9);
+    for (size_t i = 0; i < sizeof CHUNKS / sizeof CHUNKS[0]; i++) {
+        sl_srv s;
+        sl_buf buf;
+        sl_buf out;
+        rp r;
+        size_t pos = 0;
+
+        memset(&r, 0, sizeof r);
+        r.srv = &s;
+        sl_srv_init(&s, 0, SL_SRV_READ_MAX);
+        sl_buf_init(&buf);
+        sl_buf_init(&out);
+        while (pos < n) {
+            size_t k = n - pos < CHUNKS[i] ? n - pos : CHUNKS[i];
+
+            CHECK(sl_buf_append(&buf, in + pos, k) == 0);
+            pos += k;
+            CHECK(sl_srv_run(&s, &buf, &rops, &r, NULL) == SL_SRV_OK);
+            CHECK(sl_buf_append(&out, sl_buf_data(&buf), s.released) == 0);
+            sl_buf_consume(&buf, s.released);
+            s.released = 0;
+        }
+        CHECK(sl_buf_len(&out) == w);
+        CHECK_MEM(sl_buf_data(&out), want, w);
+        /* announced once each, whatever the cut, and not the message that was read */
+        CHECK(r.npassed == 3 && strncmp(r.passed, "1DC", 3) == 0);
+        sl_buf_free(&buf);
+        sl_buf_free(&out);
+    }
+}
+
 int main(void)
 {
     test_pass_and_read();
     test_drop_and_skip();
     test_big_messages();
     test_lost_framing();
+    test_replace_and_passed();
     return TEST_RESULT();
 }

@@ -89,6 +89,45 @@ int sl_scan_run(sl_scan *s, sl_buf *buf, const sl_scan_ops *ops, void *ctx)
             continue;
         }
 
+        if (ops->extended != NULL &&
+            (h.type == 'B' || h.type == 'D' || h.type == 'E' || h.type == 'C' || h.type == 'S' ||
+             (h.type == 'F' && !s->judge_fastpath))) {
+            size_t need = h.payload_len < SL_SCAN_PEEK ? h.payload_len : SL_SCAN_PEEK;
+            sl_buf repl;
+            int r;
+
+            if (avail < 5 + need) {
+                return SL_SCAN_OK; /* wait for the start of the message */
+            }
+            sl_buf_init(&repl);
+            r = ops->extended(ctx, h.type, p + 5, need, h.payload_len, &repl);
+            if (r == SL_SCAN_WAIT) {
+                s->paused = 1;
+            } else if (r == SL_SCAN_BLOCK || r == SL_SCAN_GUARD) {
+                int guard = r == SL_SCAN_GUARD;
+
+                r = swap_in(s, buf, 5, &repl) == 0 ? SL_SCAN_BLOCK : SL_SCAN_FAIL;
+                if (r == SL_SCAN_BLOCK) {
+                    s->skip_remaining = h.payload_len; /* the rest of the replaced message */
+                    s->owed += h.type == 'F';          /* replaced by a Query */
+                    s->paused = guard;
+                }
+            } else if (r == SL_SCAN_ANSWER) {
+                (void)sl_buf_replace(buf, s->released, 5, NULL,
+                                     0); /* the header; the rest follows */
+                s->skip_remaining = h.payload_len;
+            } else if (r == SL_SCAN_RELAY) {
+                s->released += 5;
+                s->pass_remaining = h.payload_len;
+                s->owed += h.type == 'S' || h.type == 'F';
+            }
+            sl_buf_free(&repl);
+            if (r == SL_SCAN_FAIL) {
+                return SL_SCAN_NOMEM;
+            }
+            continue;
+        }
+
         if (h.type == 'Q' || h.type == 'P') {
             if (h.payload_len <= s->inspect_max) {
                 sl_buf repl;
@@ -110,6 +149,8 @@ int sl_scan_run(sl_scan *s, sl_buf *buf, const sl_scan_ops *ops, void *ctx)
                         s->owed += h.type == 'Q'; /* the replacement of a Query is a Query */
                         s->paused = guard;
                     }
+                } else if (r == SL_SCAN_ANSWER) {
+                    (void)sl_buf_replace(buf, s->released, 5 + h.payload_len, NULL, 0);
                 } else if (r == SL_SCAN_RELAY) {
                     s->released += 5 + h.payload_len;
                     s->owed += h.type == 'Q';
@@ -140,6 +181,9 @@ int sl_scan_run(sl_scan *s, sl_buf *buf, const sl_scan_ops *ops, void *ctx)
                     s->skip_remaining = h.payload_len;
                     s->owed += h.type == 'Q' || h.type == 'F'; /* both are replaced by a Query */
                 }
+            } else if (r == SL_SCAN_ANSWER) {
+                (void)sl_buf_replace(buf, s->released, 5, NULL, 0);
+                s->skip_remaining = h.payload_len;
             } else if (r == SL_SCAN_RELAY) {
                 s->released += 5;
                 s->pass_remaining = h.payload_len;

@@ -14,6 +14,8 @@
  *   - SL_SRV_READ: hold it until complete (up to read_max bytes), then hand it to ops->message,
  *     which keeps it for the client or drops it.
  *   - SL_SRV_SKIP: throw it away as it arrives, unread.
+ * A relayed message is also announced to ops->passed (once, from its header) when there is one, for
+ * the callers that only need to count them.
  * The result never depends on how the stream was cut into reads. A header that cannot be valid
  * ends the scanning for good: everything that follows is relayed unread, and the caller is told. */
 
@@ -32,17 +34,25 @@ typedef struct {
     int lost;              /* the stream stopped being framed: everything is relayed unread */
     int paused; /* a callback asked to stop: nothing is looked at until sl_srv_resume() */
     size_t read_max;
+    sl_buf replacement; /* what the callback puts there when it answers SL_SRV_REPLACE */
 } sl_srv;
 
 /* What to do with a message, decided from its header. */
 enum { SL_SRV_PASS = 0, SL_SRV_READ = 1, SL_SRV_SKIP = 2 };
 
 /* What to do with a message that was read. */
-enum { SL_SRV_KEEP = 0, SL_SRV_DROP = 1 };
+enum {
+    SL_SRV_KEEP = 0,
+    SL_SRV_DROP = 1,
+    SL_SRV_REPLACE = 2 /* give the client the bytes in sl_srv.replacement instead */
+};
 
 typedef struct {
     int (*classify)(void *ctx, uint8_t type, size_t payload_len);
     int (*message)(void *ctx, uint8_t type, const uint8_t *payload, size_t len);
+    void (*passed)(void *ctx, uint8_t type, size_t payload_len); /* may be NULL */
+    void (*skipped)(void *ctx, uint8_t type,
+                    size_t payload_len); /* may be NULL: a message thrown away */
 } sl_srv_ops;
 
 enum { SL_SRV_OK = 0, SL_SRV_LOST = 1 /* the framing is gone, from now on all is relayed */ };
