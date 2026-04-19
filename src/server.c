@@ -1,6 +1,7 @@
 #include "server.h"
 
 #include <errno.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -9,12 +10,22 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
+#ifndef SLUICE_VERSION
+#define SLUICE_VERSION "0.0.0"
+#endif
+
+#include "admin.h"
+#include "budget.h"
 #include "buf.h"
 #include "clock.h"
 #include "conn.h"
+#include "events.h"
 #include "log.h"
+#include "mask.h"
+#include "metrics.h"
 #include "net.h"
 #include "pg_proto.h"
 
@@ -42,7 +53,8 @@ static void on_hup(int sig)
 /* Which connection and which of its two sockets a pollfd entry stands for. */
 typedef struct {
     sl_conn *conn;
-    int is_upstream; /* 0: the client's socket, 1: the upstream's, 2: the terminal of the prompt */
+    int is_upstream; /* 0: the client's socket, 1: the upstream's, 2: the terminal of the prompt, 3:
+                        the admin listener */
 } slot;
 
 typedef struct {
@@ -54,8 +66,14 @@ typedef struct {
     int active;
     const sl_policy *current; /* NULL when there is no policy file */
     sl_conn_env env;          /* what each connection is given */
+    sl_journal *journal; /* where the rows of DELETEs are kept for undo, when a rule asks for it */
+    uint8_t mask_key[SL_MASK_KEY_MAX + 1]; /* one more: a file that is too long is noticed */
+    size_t mask_key_len;
     int listen_fd;
     sl_prompt *prompt;
+    sl_admin *admin;
+    sl_events *events;
+    long long start_unix;
     size_t max_conns;
     uint64_t next_id;
     int64_t
@@ -104,6 +122,17 @@ static size_t compute_max_conns(void)
     return max;
 }
 
+static unsigned long long count_user(void *ctx, const sl_conn *self, const char *user, size_t len)
+{
+    const server *s = ctx;
+    unsigned long long n = 0;
+
+    for (size_t i = 0; i < s->nconns; i++) {
+        n += s->conns[i] != self && sl_conn_is_user(s->conns[i], user, len);
+    }
+    return n;
+}
+
 static int push_conn(server *s, sl_conn *c)
 {
     if (s->nconns == s->cap_conns) {
@@ -122,7 +151,8 @@ static int push_conn(server *s, sl_conn *c)
 
 static int ensure_poll_capacity(server *s)
 {
-    size_t need = 2 + 2 * s->nconns; /* the listening socket, the terminal, two per connection */
+    size_t need = 2 + SL_ADMIN_MAX_FDS + 2 * s->nconns; /* the listening socket, the terminal, the
+                                                           admin listener, two per connection */
 
     if (need > s->cap_poll) {
         size_t cap = need * 2;
@@ -221,6 +251,25 @@ static void reap(server *s)
  * the SQL parser makes unquoted names lower case. Someone who writes "Ledger" in a deny rule almost
  * certainly means ledger, and a rule that never applies protects nothing, so say so instead of
  * staying silent. */
+static void warn_mask_key(const sl_policy *p, const sl_config *cfg)
+{
+    for (size_t i = 0; i < p->nrules; i++) {
+        if (p->rules[i].mask && p->rules[i].mask_how == SL_MASK_HASH &&
+            cfg->mask_key_file[0] == '\0') {
+            sl_log_ev ev;
+
+            sl_log_begin(&ev, "warning");
+            sl_log_cstr(&ev, "rule", p->rules[i].name);
+            sl_log_cstr(&ev, "detail",
+                        "this rule hides values behind tokens (how = \"hash\") and sluice has no "
+                        "--mask-key-file: the key is made at startup, so the tokens change each "
+                        "time sluice restarts");
+            sl_log_end(&ev);
+            return;
+        }
+    }
+}
+
 static void warn_policy(const sl_policy *p)
 {
     unsigned shown = 0;
@@ -269,6 +318,18 @@ static void reload_policy(server *s)
     char err[256];
     int next = 1 - s->active;
 
+    if (s->journal != NULL) {
+        /* the file may have been renamed to be archived: the next entry starts a new one */
+        if (sl_journal_reopen(s->journal, err, sizeof err) == 0) {
+            sl_log_begin(&ev, "journal_reopened");
+            sl_log_cstr(&ev, "journal", s->cfg->undo_journal);
+        } else {
+            sl_log_begin(&ev, "journal_reopen_failed");
+            sl_log_cstr(&ev, "error", err);
+            sl_log_cstr(&ev, "detail", "entries go on in the file that was open");
+        }
+        sl_log_end(&ev);
+    }
     if (s->current == NULL) {
         sl_log_begin(&ev, "policy_reload_ignored");
         sl_log_cstr(&ev, "detail",
@@ -281,8 +342,21 @@ static void reload_policy(server *s)
         sl_log_cstr(&ev, "error", err);
         sl_log_cstr(&ev, "detail", "the previous policy stays in force");
         sl_log_end(&ev);
+        sl_metric_inc(SL_M_RELOADS, "failed", NULL);
         return;
     }
+    if (sl_policy_needs_journal(&s->pols[next]) && s->journal == NULL) {
+        sl_log_begin(&ev, "policy_reload_failed");
+        sl_log_cstr(&ev, "error",
+                    "the new policy has a rule with journal, and sluice was started without "
+                    "--undo-journal");
+        sl_log_cstr(&ev, "detail", "the previous policy stays in force");
+        sl_log_end(&ev);
+        sl_metric_inc(SL_M_RELOADS, "failed", NULL);
+        sl_policy_free(&s->pols[next]);
+        return;
+    }
+    sl_metric_inc(SL_M_RELOADS, "ok", NULL);
     sl_policy_free(&s->pols[s->active]);
     s->active = next;
     s->current = &s->pols[next];
@@ -294,6 +368,7 @@ static void reload_policy(server *s)
     sl_log_cstr(&ev, "on_uninspectable", s->current->deny_uninspectable ? "deny" : "allow");
     sl_log_end(&ev);
     warn_policy(s->current);
+    warn_mask_key(s->current, s->cfg);
 }
 
 /* A private key readable by other users is a secret that is not kept: say so. Only a warning, since
@@ -315,6 +390,104 @@ static void warn_key_permissions(const char *path, const char *option)
     sl_log_end(&ev);
 }
 
+/* The key of the tokens of "hash" masks: the file's content (16 to SL_MASK_KEY_MAX bytes), or a
+ * random one made now, which is gone when sluice stops. */
+static int load_mask_key(const sl_config *cfg, uint8_t *key, size_t *len, char *err, size_t errcap)
+{
+    FILE *f;
+    size_t n;
+
+    if (cfg->mask_key_file[0] == '\0') {
+        *len = 32;
+        if (RAND_bytes(key, (int)*len) != 1) {
+            snprintf(err, errcap, "cannot get random bytes for the mask key");
+            return -1;
+        }
+        return 0;
+    }
+    f = fopen(cfg->mask_key_file, "rb");
+    if (f == NULL) {
+        snprintf(err, errcap, "cannot read --mask-key-file %s: %s", cfg->mask_key_file,
+                 strerror(errno));
+        return -1;
+    }
+    n = fread(key, 1, SL_MASK_KEY_MAX + 1, f);
+    fclose(f);
+    if (n < 16 || n > SL_MASK_KEY_MAX) {
+        snprintf(err, errcap, "--mask-key-file %s must hold 16 to %d bytes", cfg->mask_key_file,
+                 SL_MASK_KEY_MAX);
+        return -1;
+    }
+    *len = n;
+    return 0;
+}
+
+/* ---- the admin listener, the metrics and the event command ---- */
+
+static void tap_log(void *ctx, const char *event, const char *line, size_t len)
+{
+    server *s = ctx;
+
+    sl_metric_inc(SL_M_EVENTS, event, NULL);
+    if (s->events != NULL) {
+        sl_events_offer(s->events, event, line, len);
+    }
+}
+
+static void admin_gauges(void *ctx, sl_metrics_gauges *g)
+{
+    server *s = ctx;
+
+    g->active_connections = s->nconns;
+    g->pending_confirmations = s->prompt != NULL ? sl_prompt_admin_count(s->prompt) : 0;
+    g->rules = s->current != NULL ? s->current->nrules : 0;
+    g->start_unix = s->start_unix;
+    g->now_unix = (long long)time(NULL);
+    g->version = SLUICE_VERSION;
+}
+
+static int admin_pending_json(void *ctx, sl_buf *out)
+{
+    server *s = ctx;
+
+    if (s->prompt == NULL) {
+        return sl_buf_append(out, "[]\n", 3);
+    }
+    return sl_prompt_admin_json(s->prompt, out);
+}
+
+static int admin_pending_text(void *ctx, const char *id, sl_buf *out)
+{
+    server *s = ctx;
+
+    return s->prompt != NULL ? sl_prompt_admin_text(s->prompt, id, out) : -1;
+}
+
+static int admin_answer(void *ctx, const char *id, int yes)
+{
+    server *s = ctx;
+
+    return s->prompt != NULL ? sl_prompt_admin_answer(s->prompt, id, yes) : -1;
+}
+
+/* A start that fails after some things were made: they are released, so that nothing is left (a
+ * leak checker would say so, and a test starts sluice with bad options on purpose). */
+static int fail_start(server *s, sl_tls_ctx *tls, sl_tls_ctx *client_tls)
+{
+    close(s->listen_fd);
+    if (s->current != NULL) {
+        sl_policy_free(&s->pols[s->active]);
+    }
+    sl_budget_free(s->env.budget);
+    sl_journal_close(s->journal);
+    sl_prompt_free(s->prompt);
+    sl_events_free(s->events);
+    sl_admin_free(s->admin);
+    sl_tls_ctx_free(tls);
+    sl_tls_ctx_free(client_tls);
+    return 1;
+}
+
 int sl_server_run(const sl_config *cfg)
 {
     server s;
@@ -323,7 +496,7 @@ int sl_server_run(const sl_config *cfg)
     int listen_tls;
     struct sigaction sa;
     sl_log_ev ev;
-    char err[256];
+    char err[1536]; /* a message names a path of up to 1023 bytes */
     char upstream[sizeof cfg->upstream_host + sizeof cfg->upstream_port + 2]; /* "host:port" */
 
     memset(&s, 0, sizeof s);
@@ -339,6 +512,63 @@ int sl_server_run(const sl_config *cfg)
             return 1;
         }
         s.current = &s.pols[0];
+    }
+
+    if (cfg->log_chain_key_file[0] != '\0') {
+        uint8_t ck[SL_MASK_KEY_MAX + 1];
+        size_t cn = 0;
+        FILE *cf = fopen(cfg->log_chain_key_file, "rb");
+
+        if (cf != NULL) {
+            cn = fread(ck, 1, sizeof ck, cf);
+            fclose(cf);
+        }
+        if (cf == NULL || cn < 16 || cn > SL_MASK_KEY_MAX) {
+            fprintf(stderr,
+                    "sluice: --log-chain-key-file %s must be a readable file of 16 to %d bytes\n",
+                    cfg->log_chain_key_file, SL_MASK_KEY_MAX);
+            return 1;
+        }
+        if (sl_log_chain_start(ck, cn) != 0) {
+            fprintf(stderr, "sluice: cannot start the chain of the log\n");
+            return 1;
+        }
+        memset(ck, 0, sizeof ck);
+    }
+    if (load_mask_key(cfg, s.mask_key, &s.mask_key_len, err, sizeof err) != 0) {
+        fprintf(stderr, "sluice: %s\n", err);
+        if (s.current) {
+            sl_policy_free(&s.pols[s.active]);
+        }
+        return 1;
+    }
+
+    if (cfg->undo_journal[0] != '\0') {
+        struct stat jst;
+
+        if (stat(cfg->undo_journal, &jst) == 0 && (jst.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+            sl_log_begin(&ev, "warning");
+            sl_log_cstr(
+                &ev, "detail",
+                "the undo journal is readable by other users and holds the rows themselves: "
+                "restrict it (chmod 600)");
+            sl_log_end(&ev);
+        }
+        s.journal = sl_journal_open(cfg->undo_journal, cfg->undo_journal_max, err, sizeof err);
+        if (s.journal == NULL) {
+            fprintf(stderr, "sluice: %s\n", err);
+            if (s.current) {
+                sl_policy_free(&s.pols[s.active]);
+            }
+            return 1;
+        }
+    }
+    if (s.current != NULL && sl_policy_needs_journal(s.current) && s.journal == NULL) {
+        fprintf(
+            stderr,
+            "sluice: the policy has a rule with journal: start sluice with --undo-journal FILE\n");
+        sl_policy_free(&s.pols[s.active]);
+        return 1;
     }
 
     /* Same for TLS: asked for and impossible means sluice does not start, it never falls back to
@@ -372,11 +602,24 @@ int sl_server_run(const sl_config *cfg)
     s.env.tls = tls;
     s.env.client_tls = client_tls;
     s.prompt = sl_prompt_new(cfg->confirm_tty);
+    if (s.prompt != NULL && cfg->confirm_command[0] != '\0' &&
+        sl_prompt_set_command(s.prompt, cfg->confirm_command) != 0) {
+        fprintf(stderr, "sluice: out of memory\n");
+        sl_prompt_free(s.prompt);
+        s.prompt = NULL;
+    }
+    if (s.prompt != NULL && cfg->confirm_admin) {
+        (void)sl_prompt_set_admin(s.prompt);
+    }
     s.env.prompt = s.prompt;
-
-    s.listen_fd = sl_net_listen(cfg->listen_host, cfg->listen_port, err, sizeof err);
-    if (s.listen_fd < 0) {
-        fprintf(stderr, "sluice: %s\n", err);
+    s.env.count_user = count_user;
+    s.env.count_ctx = &s;
+    s.env.journal = s.journal;
+    s.env.mask_key = s.mask_key;
+    s.env.mask_key_len = s.mask_key_len;
+    s.env.budget = sl_budget_new();
+    if (s.env.budget == NULL) {
+        fprintf(stderr, "sluice: out of memory\n");
         if (s.current) {
             sl_policy_free(&s.pols[s.active]);
         }
@@ -384,6 +627,79 @@ int sl_server_run(const sl_config *cfg)
         sl_tls_ctx_free(tls);
         sl_tls_ctx_free(client_tls);
         return 1;
+    }
+
+    s.listen_fd = sl_net_listen(cfg->listen_host, cfg->listen_port, err, sizeof err);
+    if (s.listen_fd < 0) {
+        fprintf(stderr, "sluice: %s\n", err);
+        if (s.current) {
+            sl_policy_free(&s.pols[s.active]);
+        }
+        sl_budget_free(s.env.budget);
+        sl_journal_close(s.journal);
+        sl_prompt_free(s.prompt);
+        sl_tls_ctx_free(tls);
+        sl_tls_ctx_free(client_tls);
+        return 1;
+    }
+
+    s.start_unix = (long long)time(NULL);
+    if (cfg->event_command[0] != '\0') {
+        s.events = sl_events_new(cfg->event_command, cfg->event_filter);
+        if (s.events == NULL) {
+            fprintf(stderr, "sluice: out of memory\n");
+            return fail_start(&s, tls, client_tls);
+        }
+    }
+    if (cfg->admin_host[0] != '\0') {
+        sl_admin_ops ops = {&s, admin_gauges, admin_pending_json, admin_pending_text, admin_answer};
+        uint8_t token[1025];
+        size_t tn = 0;
+
+        if (cfg->admin_token_file[0] != '\0') {
+            FILE *tf = fopen(cfg->admin_token_file, "rb");
+
+            if (tf != NULL) {
+                tn = fread(token, 1, sizeof token, tf);
+                fclose(tf);
+            }
+            while (tn > 0 &&
+                   (token[tn - 1] == '\n' || token[tn - 1] == '\r' || token[tn - 1] == ' ')) {
+                tn--; /* a token file usually ends with a newline */
+            }
+            if (tn < 16 || tn > 1024) {
+                fprintf(
+                    stderr,
+                    "sluice: --admin-token-file %s must be a readable file holding a token of 16 "
+                    "to 1024 bytes\n",
+                    cfg->admin_token_file);
+                memset(token, 0, sizeof token);
+                return fail_start(&s, tls, client_tls);
+            }
+        }
+        s.admin = sl_admin_new(cfg->admin_host, cfg->admin_port,
+                               tn > 0 ? (const char *)token : NULL, tn, &ops, err, sizeof err);
+        memset(token, 0, sizeof token);
+        if (s.admin == NULL) {
+            fprintf(stderr, "sluice: --admin: %s\n", err);
+            return fail_start(&s, tls, client_tls);
+        }
+    }
+    sl_log_set_tap(tap_log, &s);
+    if (s.admin != NULL) {
+        sl_log_begin(&ev, "admin_listening");
+        sl_log_cstr(&ev, "host", cfg->admin_host);
+        sl_log_int(&ev, "port", sl_admin_port(s.admin));
+        sl_log_bool(&ev, "token", cfg->admin_token_file[0] != '\0');
+        sl_log_bool(&ev, "confirmations", cfg->confirm_admin);
+        sl_log_end(&ev);
+        if (cfg->admin_token_file[0] == '\0') {
+            sl_log_begin(&ev, "warning");
+            sl_log_cstr(&ev, "detail",
+                        "--admin has no token: anyone who can reach it on this machine can read "
+                        "the counters (add --admin-token-file)");
+            sl_log_end(&ev);
+        }
     }
 
     memset(&sa, 0, sizeof sa);
@@ -424,6 +740,7 @@ int sl_server_run(const sl_config *cfg)
 
     if (s.current != NULL) {
         warn_policy(s.current);
+        warn_mask_key(s.current, cfg);
     }
     if (cfg->listen_tls_self_signed) {
         sl_log_begin(&ev, "warning");
@@ -449,6 +766,8 @@ int sl_server_run(const sl_config *cfg)
      * operator chose. */
     warn_key_permissions(cfg->upstream_key, "--upstream-key");
     warn_key_permissions(cfg->listen_tls_key, "--listen-tls-key");
+    warn_key_permissions(cfg->mask_key_file, "--mask-key-file");
+    warn_key_permissions(cfg->log_chain_key_file, "--log-chain-key-file");
     if (cfg->upstream_tls == SL_TLS_OFF && !sl_net_host_is_local(cfg->upstream_host)) {
         sl_log_begin(&ev, "warning");
         sl_log_cstr(&ev, "detail",
@@ -497,6 +816,25 @@ int sl_server_run(const sl_config *cfg)
             s.slots[np].conn = NULL;
             s.slots[np].is_upstream = 2;
             np++;
+        }
+
+        if (s.admin != NULL) {
+            struct pollfd ap[SL_ADMIN_MAX_FDS];
+            size_t an = sl_admin_pollfds(s.admin, ap);
+            int64_t ad = sl_admin_deadline(s.admin);
+
+            for (size_t k = 0; k < an; k++) {
+                s.pfds[np] = ap[k];
+                s.slots[np].conn = NULL;
+                s.slots[np].is_upstream = 3;
+                np++;
+            }
+            if (ad >= 0 && ad - now < timeout) {
+                timeout = ad - now > 0 ? (int)(ad - now) : 0;
+            }
+        }
+        if (s.events != NULL && sl_events_busy(s.events) > 0 && timeout > 200) {
+            timeout = 200; /* the commands that ended are noticed within a fifth of a second */
         }
 
         for (size_t i = 0; i < s.nconns; i++) {
@@ -553,6 +891,12 @@ int sl_server_run(const sl_config *cfg)
             for (size_t k = 1; k < np; k++) {
                 sl_conn *c = s.slots[k].conn;
 
+                if (s.slots[k].is_upstream == 3) {
+                    if (s.pfds[k].revents != 0 && s.admin != NULL) {
+                        sl_admin_ready(s.admin, s.pfds[k].fd, s.pfds[k].revents, sl_now_ms());
+                    }
+                    continue;
+                }
                 if (s.slots[k].is_upstream == 2) {
                     if (s.pfds[k].revents != 0 && s.prompt != NULL) {
                         sl_prompt_readable(s.prompt);
@@ -571,6 +915,12 @@ int sl_server_run(const sl_config *cfg)
         }
 
         now = sl_now_ms();
+        if (s.admin != NULL) {
+            sl_admin_tick(s.admin, now);
+        }
+        if (s.events != NULL) {
+            sl_events_tick(s.events, now);
+        }
         for (size_t i = 0; i < s.nconns; i++) {
             sl_conn_service_pending(s.conns[i]);
             sl_conn_check_deadline(s.conns[i], now);
@@ -581,6 +931,21 @@ int sl_server_run(const sl_config *cfg)
     sl_log_begin(&ev, "shutdown");
     sl_log_int(&ev, "open_connections", (long long)s.nconns);
     sl_log_end(&ev);
+    sl_log_set_tap(NULL, NULL);
+    if (s.events != NULL) {
+        /* what is still being told to somebody (the last events: a shutdown, a kill) gets five
+         * seconds to be said */
+        int64_t until = sl_now_ms() + 5000;
+
+        while (sl_events_busy(s.events) > 0 && sl_now_ms() < until) {
+            struct timespec nap = {0, 20 * 1000 * 1000};
+
+            nanosleep(&nap, NULL);
+            sl_events_tick(s.events, sl_now_ms());
+        }
+    }
+    sl_admin_free(s.admin);
+    sl_events_free(s.events);
 
     for (size_t i = 0; i < s.nconns; i++) {
         sl_conn_abort(s.conns[i], "shutdown");
@@ -593,8 +958,11 @@ int sl_server_run(const sl_config *cfg)
     if (s.current != NULL) {
         sl_policy_free(&s.pols[s.active]);
     }
+    sl_budget_free(s.env.budget);
+    sl_journal_close(s.journal);
     sl_prompt_free(s.prompt);
     sl_tls_ctx_free(tls);
     sl_tls_ctx_free(client_tls);
+    sl_log_chain_stop();
     return 0;
 }

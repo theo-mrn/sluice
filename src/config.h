@@ -30,10 +30,24 @@ typedef struct {
                                  empty: none */
     char upstream_key[1024];  /* its private key (PEM, not encrypted) */
     sl_log_sql_mode log_sql;
+    char admin_host[256]; /* --admin: where /metrics and the answers to confirmations are served */
+    char admin_port[8];
+    char admin_token_file[1024];
+    int confirm_admin;        /* the operator's questions are answered at the admin listener */
+    char event_command[1024]; /* run for the events of event_filter, the line of the log on stdin */
+    char event_filter[256];   /* comma-separated names of events; empty: the default */
+    int tag_application; /* application_name gets " [sluice N]" (N: the connection's id in the log)
+                          */
+    int log_results;     /* a `result` event for every statement: its outcome, rows and time */
     char listen_tls_cert[1024]; /* sluice as a TLS server for its clients: certificate (PEM), */
     char listen_tls_key[1024];  /* its private key (not encrypted), */
     int listen_tls_self_signed; /* or a certificate made at startup */
     char confirm_tty[1024];     /* where a person is asked to confirm; empty: /dev/tty */
+    char undo_journal[1024];    /* where the rows of DELETEs are kept for undo; empty: none */
+    unsigned long long undo_journal_max; /* bytes; 0: no limit */
+    char log_chain_key_file[1024]; /* the key that chains the lines of the log; empty: no chain */
+    char mask_key_file[1024];   /* the key of the tokens of "hash" masks; empty: made at startup */
+    char confirm_command[1024]; /* or a command that is asked instead; empty: the terminal */
 } sl_config;
 
 /* Splits "HOST:PORT" or "[IPV6]:PORT" into host and port (without the brackets). The port must be a

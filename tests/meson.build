@@ -1,6 +1,6 @@
 test_inc = include_directories('.')
 
-foreach name : ['buf', 'json', 'log', 'pg_proto', 'config', 'sql_check', 'policy', 'scanner', 'net', 'srvscan', 'confirm', 'prompt']
+foreach name : ['buf', 'json', 'log', 'pg_proto', 'config', 'sql_check', 'policy', 'scanner', 'net', 'srvscan', 'extstate', 'confirm', 'prompt', 'budget', 'mask', 'journal', 'admin']
   exe = executable(
     'test_' + name,
     'test_' + name + '.c',
@@ -32,6 +32,17 @@ if python.found()
     python,
     args : [files('realpg.py'), sluice],
     env : {'SLUICE_OPENSSL' : openssl_tool},
+    timeout : 600,
+    suite : 'realpg',
+  )
+
+  # Real client libraries (psycopg, asyncpg, SQLAlchemy, JDBC) against a real PostgreSQL: skipped (status 77)
+  # unless SLUICE_REAL_PG=1 and the libraries are importable. Run it with
+  #   SLUICE_REAL_PG=1 uvx --with "psycopg[binary]" --with asyncpg --with sqlalchemy python3 tests/drivers.py build/sluice
+  test(
+    'drivers',
+    python,
+    args : [files('drivers.py'), sluice],
     timeout : 600,
     suite : 'realpg',
   )

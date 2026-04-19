@@ -4,3 +4,15 @@ option(
   value : 'disabled',
   description : 'Also build fuzz_libfuzzer, the fuzz targets linked with libFuzzer (needs a compiler that ships it, which Apple clang does not)',
 )
+option(
+  'static',
+  type : 'boolean',
+  value : false,
+  description : 'Link OpenSSL statically (and on Linux the whole program: use it with musl, e.g. on Alpine) so that the binary runs on any machine of its kind. This is how the release binaries are built.',
+)
+option(
+  'commit',
+  type : 'string',
+  value : '',
+  description : 'The commit this build is of, shown by --version. Empty: asked of git, or "unknown" when there is none (a source archive).',
+)

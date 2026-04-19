@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "net.h"
+
 int sl_addr_parse(const char *spec, char *host, size_t hostcap, char *port, size_t portcap)
 {
     const char *h;
@@ -84,9 +86,11 @@ static int opt_is(const char *arg, size_t namelen, const char *opt)
 int sl_config_parse(sl_config *cfg, int argc, char *const argv[], char *err, size_t errcap)
 {
     const char *listen_spec = NULL;
+    const char *admin_spec = NULL;
     const char *upstream_spec = NULL;
 
     memset(cfg, 0, sizeof *cfg);
+    cfg->undo_journal_max = 256ULL << 20;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -101,13 +105,27 @@ int sl_config_parse(sl_config *cfg, int argc, char *const argv[], char *err, siz
         int is_cert = opt_is(arg, namelen, "--upstream-cert");
         int is_key = opt_is(arg, namelen, "--upstream-key");
         int is_tty = opt_is(arg, namelen, "--confirm-tty");
+        int is_cmd = opt_is(arg, namelen, "--confirm-command");
+        int is_logres = opt_is(arg, namelen, "--log-results");
+        int is_tag = opt_is(arg, namelen, "--tag-application-name");
+        int is_admin = opt_is(arg, namelen, "--admin");
+        int is_atok = opt_is(arg, namelen, "--admin-token-file");
+        int is_cadm = opt_is(arg, namelen, "--confirm-admin");
+        int is_evcmd = opt_is(arg, namelen, "--event-command");
+        int is_evflt = opt_is(arg, namelen, "--event-filter");
+        int is_mkey = opt_is(arg, namelen, "--mask-key-file");
+        int is_lck = opt_is(arg, namelen, "--log-chain-key-file");
+        int is_ujr = opt_is(arg, namelen, "--undo-journal");
+        int is_ujm = opt_is(arg, namelen, "--undo-journal-max");
         int is_ltls = opt_is(arg, namelen, "--listen-tls");
         int is_lcert = opt_is(arg, namelen, "--listen-tls-cert");
         int is_lkey = opt_is(arg, namelen, "--listen-tls-key");
         const char *val;
 
         if (!is_listen && !is_upstream && !is_policy && !is_tls && !is_ca && !is_logsql &&
-            !is_cert && !is_key && !is_tty && !is_ltls && !is_lcert && !is_lkey) {
+            !is_cert && !is_key && !is_tty && !is_cmd && !is_logres && !is_tag && !is_admin &&
+            !is_atok && !is_cadm && !is_evcmd && !is_evflt && !is_ltls && !is_lcert && !is_lkey &&
+            !is_mkey && !is_lck && !is_ujr && !is_ujm) {
             snprintf(err, errcap, "unknown argument '%s'", arg);
             return -1;
         }
@@ -145,6 +163,64 @@ int sl_config_parse(sl_config *cfg, int argc, char *const argv[], char *err, siz
             strcpy(dst, val);
             continue;
         }
+        if (is_ujr) {
+            if (strlen(val) == 0 || strlen(val) >= sizeof cfg->undo_journal) {
+                snprintf(err, errcap, "invalid --undo-journal path");
+                return -1;
+            }
+            strcpy(cfg->undo_journal, val);
+            continue;
+        }
+        if (is_ujm) {
+            char *endp = NULL;
+            unsigned long long v = strtoull(val, &endp, 10);
+
+            if (endp == val || v == 0 || v > (1ULL << 40)) {
+                snprintf(err, errcap, "--undo-journal-max is a size like 256MB or 2G");
+                return -1;
+            }
+            if (strcmp(endp, "") == 0 || strcmp(endp, "B") == 0) {
+            } else if (strcmp(endp, "K") == 0 || strcmp(endp, "KB") == 0) {
+                v <<= 10;
+            } else if (strcmp(endp, "M") == 0 || strcmp(endp, "MB") == 0) {
+                v <<= 20;
+            } else if (strcmp(endp, "G") == 0 || strcmp(endp, "GB") == 0) {
+                v <<= 30;
+            } else {
+                snprintf(err, errcap, "--undo-journal-max is a size like 256MB or 2G");
+                return -1;
+            }
+            if (v > (1ULL << 40)) {
+                snprintf(err, errcap, "--undo-journal-max is at most 1TB");
+                return -1;
+            }
+            cfg->undo_journal_max = v;
+            continue;
+        }
+        if (is_lck) {
+            if (strlen(val) == 0 || strlen(val) >= sizeof cfg->log_chain_key_file) {
+                snprintf(err, errcap, "invalid --log-chain-key-file path");
+                return -1;
+            }
+            strcpy(cfg->log_chain_key_file, val);
+            continue;
+        }
+        if (is_mkey) {
+            if (strlen(val) == 0 || strlen(val) >= sizeof cfg->mask_key_file) {
+                snprintf(err, errcap, "invalid --mask-key-file path");
+                return -1;
+            }
+            strcpy(cfg->mask_key_file, val);
+            continue;
+        }
+        if (is_cmd) {
+            if (strlen(val) == 0 || strlen(val) >= sizeof cfg->confirm_command) {
+                snprintf(err, errcap, "invalid --confirm-command");
+                return -1;
+            }
+            strcpy(cfg->confirm_command, val);
+            continue;
+        }
         if (is_tty) {
             if (strlen(val) == 0 || strlen(val) >= sizeof cfg->confirm_tty) {
                 snprintf(err, errcap, "invalid --confirm-tty path");
@@ -171,6 +247,54 @@ int sl_config_parse(sl_config *cfg, int argc, char *const argv[], char *err, siz
                 return -1;
             }
             strcpy(dst, val);
+            continue;
+        }
+        if (is_admin) {
+            admin_spec = val;
+            continue;
+        }
+        if (is_atok) {
+            if (strlen(val) == 0 || strlen(val) >= sizeof cfg->admin_token_file) {
+                snprintf(err, errcap, "invalid --admin-token-file path");
+                return -1;
+            }
+            strcpy(cfg->admin_token_file, val);
+            continue;
+        }
+        if (is_cadm) {
+            if (strcmp(val, "on") != 0 && strcmp(val, "off") != 0) {
+                snprintf(err, errcap, "--confirm-admin must be on or off");
+                return -1;
+            }
+            cfg->confirm_admin = strcmp(val, "on") == 0;
+            continue;
+        }
+        if (is_evcmd || is_evflt) {
+            char *to = is_evcmd ? cfg->event_command : cfg->event_filter;
+            size_t cap = is_evcmd ? sizeof cfg->event_command : sizeof cfg->event_filter;
+
+            if (strlen(val) == 0 || strlen(val) >= cap) {
+                snprintf(err, errcap, "invalid %s",
+                         is_evcmd ? "--event-command" : "--event-filter");
+                return -1;
+            }
+            strcpy(to, val);
+            continue;
+        }
+        if (is_tag) {
+            if (strcmp(val, "on") != 0 && strcmp(val, "off") != 0) {
+                snprintf(err, errcap, "--tag-application-name must be on or off");
+                return -1;
+            }
+            cfg->tag_application = strcmp(val, "on") == 0;
+            continue;
+        }
+        if (is_logres) {
+            if (strcmp(val, "on") != 0 && strcmp(val, "off") != 0) {
+                snprintf(err, errcap, "--log-results must be on or off");
+                return -1;
+            }
+            cfg->log_results = strcmp(val, "on") == 0;
             continue;
         }
         if (is_logsql) {
@@ -239,6 +363,38 @@ int sl_config_parse(sl_config *cfg, int argc, char *const argv[], char *err, siz
         snprintf(err, errcap,
                  "--listen-tls self-signed and --listen-tls-cert are two ways to the same thing: "
                  "choose one");
+        return -1;
+    }
+    if (admin_spec != NULL) {
+        if (sl_addr_parse(admin_spec, cfg->admin_host, sizeof cfg->admin_host, cfg->admin_port,
+                          sizeof cfg->admin_port) != 0) {
+            snprintf(err, errcap, "invalid --admin address '%s' (expected HOST:PORT)", admin_spec);
+            return -1;
+        }
+        if (cfg->admin_token_file[0] == '\0' &&
+            (cfg->confirm_admin || !sl_net_host_is_local(cfg->admin_host))) {
+            snprintf(err, errcap,
+                     "--admin needs --admin-token-file when it listens beyond this machine or "
+                     "when it answers confirmations (--confirm-admin)");
+            return -1;
+        }
+    } else if (cfg->admin_token_file[0] != '\0' || cfg->confirm_admin) {
+        snprintf(err, errcap, "--admin-token-file and --confirm-admin need --admin");
+        return -1;
+    }
+    if (cfg->confirm_admin && (cfg->confirm_command[0] != '\0' || cfg->confirm_tty[0] != '\0')) {
+        snprintf(err, errcap,
+                 "--confirm-admin, --confirm-command and --confirm-tty are three ways to be "
+                 "asked: choose one");
+        return -1;
+    }
+    if (cfg->event_filter[0] != '\0' && cfg->event_command[0] == '\0') {
+        snprintf(err, errcap, "--event-filter needs --event-command");
+        return -1;
+    }
+    if (cfg->confirm_command[0] != '\0' && cfg->confirm_tty[0] != '\0') {
+        snprintf(err, errcap,
+                 "--confirm-command and --confirm-tty are two ways to be asked: choose one");
         return -1;
     }
     if (cfg->upstream_ca[0] != '\0' && cfg->upstream_tls == SL_TLS_OFF) {

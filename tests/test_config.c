@@ -161,6 +161,15 @@ static void test_config(void)
     CHECK(PARSE(&cfg, err, "--listen", "a:1", "--upstream", "b:2", "--log-sql", "some") == -1);
     CHECK(strstr(err, "must be full, normalized or none") != NULL);
 
+    /* the outcome of each statement: off unless asked for */
+    CHECK(PARSE(&cfg, err, "--listen", "a:1", "--upstream", "b:2") == 0 && cfg.log_results == 0);
+    CHECK(PARSE(&cfg, err, "--listen", "a:1", "--upstream", "b:2", "--log-results", "on") == 0 &&
+          cfg.log_results == 1);
+    CHECK(PARSE(&cfg, err, "--listen", "a:1", "--upstream", "b:2", "--log-results=off") == 0 &&
+          cfg.log_results == 0);
+    CHECK(PARSE(&cfg, err, "--listen", "a:1", "--upstream", "b:2", "--log-results", "yes") == -1 &&
+          strstr(err, "on or off") != NULL);
+
     /* the policy file */
     CHECK(PARSE(&cfg, err, "--listen", "a:1", "--upstream", "b:2") == 0);
     CHECK_STR(cfg.policy_path, ""); /* none: relay and log only */

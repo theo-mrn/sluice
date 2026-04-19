@@ -9,7 +9,9 @@
 
 #include <stdint.h>
 
+#include "budget.h"
 #include "config.h"
+#include "journal.h"
 #include "policy.h"
 #include "prompt.h"
 #include "tls.h"
@@ -26,6 +28,15 @@ typedef struct {
     const sl_policy *const *policy;
     sl_tls_ctx *tls;        /* NULL: plain text to the upstream */
     sl_tls_ctx *client_tls; /* NULL: clients are served in clear text; else they must use TLS */
+    /* How many connections (other than `self`) are open for this user: for max_connections. May be
+     * NULL. */
+    unsigned long long (*count_user)(void *ctx, const sl_conn *self, const char *user, size_t len);
+    void *count_ctx;
+    sl_journal *journal;     /* where the rows of DELETEs are kept for undo; may be NULL */
+    const uint8_t *mask_key; /* makes the tokens of a "hash" mask: they are the same while it is */
+    size_t mask_key_len;
+    sl_budget
+        *budget; /* what each user has carried out and changed lately (budget.h); may be NULL */
     sl_prompt *prompt; /* where a person confirms a DELETE or UPDATE (see confirm.h); may be NULL */
 } sl_conn_env;
 
@@ -61,5 +72,8 @@ void sl_conn_abort(sl_conn *c, const char *reason);
 
 /* Non-zero once the connection is finished and can be freed. */
 int sl_conn_is_done(const sl_conn *c);
+
+/* Is this a live connection of that user (one that has told its name)? */
+int sl_conn_is_user(const sl_conn *c, const char *user, size_t len);
 
 #endif
