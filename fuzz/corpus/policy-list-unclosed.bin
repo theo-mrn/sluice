@@ -1,0 +1,5 @@
+[[rule]]
+name = "a"
+match = "any"
+users = [
+  "x", # never closed

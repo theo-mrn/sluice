@@ -1,0 +1,14 @@
+[[rule]]
+name = "reads"
+match = "any"
+action = "limit"
+users = ["agent"]
+budget_rows = "100000"
+budget_bytes = "50MB"
+window = "1h"
+[[rule]]
+name = "writes"
+match = "any"
+action = "limit"
+budget_changed = "1000"
+window = "7d"

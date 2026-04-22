@@ -1,0 +1,6 @@
+[[rule]]
+name = "x"
+match = "any"
+action = "limit"
+budget_rows = "5"
+window = "8d"

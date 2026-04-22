@@ -1,0 +1,4 @@
+[[rule]]
+name = "x"
+match = "any"
+functions = ["a b", "*", "x.y.z"]

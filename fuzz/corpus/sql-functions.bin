@@ -1,0 +1,1 @@
+select pg_read_file('x'), s.f(1), "Q"(2) from t returning pg_sleep(1); declare c cursor for select set_config('a','b',false)

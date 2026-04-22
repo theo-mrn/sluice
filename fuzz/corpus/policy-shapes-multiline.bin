@@ -1,0 +1,7 @@
+[[rule]]
+name = "a"
+match = "any"
+outside_fingerprints = [
+  "0123456789abcdef", # one
+  "fedcba9876543210",
+]

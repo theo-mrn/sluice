@@ -1,0 +1,10 @@
+[[rule]]
+name = "d"
+match = "drop"
+action = "confirm"
+confirm_via = "operator"
+[[rule]]
+name = "u"
+match = "update"
+action = "confirm"
+confirm_via = "session"

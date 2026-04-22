@@ -1,0 +1,8 @@
+[[rule]]
+name = "a"
+match = "ddl"
+dry_run = "on"
+during = ["mon-fri 08:00-19:00", "22:00-06:00"]
+except_during = ["sat,sun 00:00-24:00"]
+valid_from = "2026-12-01"
+valid_until = "2026-12-01T20:00:15Z"

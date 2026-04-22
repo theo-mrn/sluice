@@ -10,7 +10,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "corpus")
 
-STARTUP, MESSAGE, STATEMENTS, BLOCKING, JSON, ADDRESS, POLICY, SQL, BUF, SASL, SCANNER, SRVSCAN, CONFIRM = range(13)
+STARTUP, MESSAGE, STATEMENTS, BLOCKING, JSON, ADDRESS, POLICY, SQL, BUF, SASL, SCANNER, SRVSCAN, CONFIRM, EXTSTATE, BUDGET, MASK, UNDO, ADMIN = range(18)
 
 # the scanner target: one byte of options, one byte that seeds the cuts, then the client's stream.
 # options: bit 0 block statements, 1 block unreadable, 2 close on frame error, 3 judge fast-path calls,
@@ -117,8 +117,64 @@ match = "ddl"
 action = "allow"
 tables = ["scratch"]
 '''),
+    "policy-budgets": (POLICY, b'''[[rule]]
+name = "reads"
+match = "any"
+action = "limit"
+users = ["agent"]
+budget_rows = "100000"
+budget_bytes = "50MB"
+window = "1h"
+[[rule]]
+name = "writes"
+match = "any"
+action = "limit"
+budget_changed = "1000"
+window = "7d"
+'''),
+    "policy-confirm-via": (POLICY, b'''[[rule]]
+name = "d"
+match = "drop"
+action = "confirm"
+confirm_via = "operator"
+[[rule]]
+name = "u"
+match = "update"
+action = "confirm"
+confirm_via = "session"
+'''),
+    "policy-bad-window": (POLICY, b'[[rule]]\nname = "x"\nmatch = "any"\naction = "limit"\nbudget_rows = "5"\nwindow = "8d"\n'),
+    "policy-bad-via": (POLICY, b'[[rule]]\nname = "x"\nmatch = "delete"\naction = "confirm"\nconfirm_via = "email"\n'),
+    "budget-ops": (BUDGET, bytes([0, 1, 2, 2, 1, 40, 2, 1, 200, 5, 1, 3, 3, 0, 30, 5, 1, 9, 1, 1, 0])),
+    "budget-clock-back": (BUDGET, bytes([0, 0, 2, 2, 0, 90, 3, 1, 50, 4, 0, 200, 5, 0, 7, 2, 0, 255, 5, 0, 7])),
+    "mask-structured": (MASK, bytes([0x1f, 4, 0, 1, 2, 3, 0, 4, 5, 6, 7, 1, 8, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])),
+    "mask-structured-pattern-only": (MASK, bytes([0x0e, 4, 2, 0, 5, 3, 1, 4, 255, 6, 7, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 9])),
+    "mask-row-raw": (MASK, bytes([0x11, 1, 12]) + struct.pack("!HI", 1, 3) + b"abc" + b"\0\0\0"),
+    "mask-error-raw": (MASK, bytes([0x0f, 2, 40]) + b"SERROR\0Mdup\0DKey (email)=(a@b.cc) already exists.\0\0"),
+    "sql-merge-delete": (SQL, b"merge into t using s on t.id = s.id when matched then delete when not matched then insert values (1) returning merge_action()"),
+    "sql-upsert": (SQL, b"insert into t (id, a) select id, a from s on conflict (id) do update set a = excluded.a returning *"),
+    "undo-line": (UNDO, b'\x01{"id":"aaaaaaaaaaaaaaaa","ts":"2026-01-01T00:00:00Z","table":"t","rows":2,"complete":true,"columns":["a","b"],"data":[["1",null],["x\\ny","\\u00e9"]],"side_known":true,"side":[{"table":"c","deleted":3}]}'),
+    "undo-line-update": (UNDO, b'\x01{"id":"aaaaaaaaaaaaaaaa","kind":"update","table":"t","rows":2,"complete":true,"columns":["a","b"],"data":[["1",null],["x","y"]],"new":[["1","z"],["x",null]]}'),
+    "undo-line-update-mismatch": (UNDO, b'\x01{"id":"a","kind":"update","columns":["a"],"data":[["1"],["2"]],"new":[["1"]]}'),
+    "undo-rows-update": (UNDO, bytes([0x0a, 0x86]) + struct.pack("!H", 2) + b"id\0" + struct.pack("!IhIhih", 0, 0, 25, -1, -1, 0)
+                         + b"id\0" + struct.pack("!IhIhih", 0, 0, 25, -1, -1, 0)
+                         + struct.pack("!I", 14) + struct.pack("!H", 2) + struct.pack("!I", 1) + b"a" + struct.pack("!I", 1) + b"b"),
+    "undo-line-hostile": (UNDO, b'\x01{"id":"x","columns":["a"],"data":[["\\ud800"]]}'),
+    "undo-rows": (UNDO, bytes([0x0a, 6]) + struct.pack("!H", 1) + b"id\0" + struct.pack("!IhIhih", 0, 0, 25, -1, -1, 0)
+                  + struct.pack("!I", 8) + struct.pack("!HI", 1, 2) + b"ab"),
     "policy-bad-table": (POLICY, b'[[rule]]\nname = "x"\nmatch = "any"\ntables = ["a.b.c"]\n'),
     "policy-bad-key": (POLICY, b'[[rule]]\nname = "x"\nmatch = "ddl"\nbogus = "1"\n'),
+    "policy-guards": (POLICY, b'[[rule]]\nname = "a"\nmatch = "set_session"\naction = "kill"\n[[rule]]\nname = "b"\nmatch = "dangerous"\n[[rule]]\nname = "c"\nmatch = "any"\naction = "alert"\ntables = ["t"]\nfunctions = ["pg_*", "s.f"]\n'),
+    "policy-bad-function": (POLICY, b'[[rule]]\nname = "x"\nmatch = "any"\nfunctions = ["a b", "*", "x.y.z"]\n'),
+    "sql-functions": (SQL, b"select pg_read_file('x'), s.f(1), \"Q\"(2) from t returning pg_sleep(1); declare c cursor for select set_config('a','b',false)"),
+    "policy-time": (POLICY, b'[[rule]]\nname = "a"\nmatch = "ddl"\ndry_run = "on"\nduring = ["mon-fri 08:00-19:00", "22:00-06:00"]\nexcept_during = ["sat,sun 00:00-24:00"]\nvalid_from = "2026-12-01"\nvalid_until = "2026-12-01T20:00:15Z"\n'),
+    "policy-bad-time": (POLICY, b'[[rule]]\nname = "a"\nmatch = "ddl"\nduring = ["funday 25:61-24:01", "08:00-08:00"]\nvalid_until = "2026-02-30T99:99Z"\n'),
+    "policy-shapes-multiline": (POLICY, b'[[rule]]\nname = "a"\nmatch = "any"\noutside_fingerprints = [\n  "0123456789abcdef", # one\n  "fedcba9876543210",\n]\n'),
+    "policy-list-unclosed": (POLICY, b'[[rule]]\nname = "a"\nmatch = "any"\nusers = [\n  "x", # never closed\n'),
+    "policy-limits-new": (POLICY, b'[[rule]]\nname = "a"\nmatch = "any"\naction = "limit"\nbudget_statements = "100"\nwindow = "1h"\nmax_transaction = "5m"\n'),
+    "admin-metrics": (ADMIN, bytes([1, 8, 30]) + b"GETmetrics\x00Bearer fuzz-token-0123456789"),
+    "admin-confirm": (ADMIN, bytes([1, 40, 40]) + b"POSTconfirm/0123456789abcdef/yes"),
+    "admin-label-newline": (ADMIN, bytes([0, 60, 5]) + b"GETx\n\"\\label\n"),
     "policy-multiline": (POLICY, b'mode = """multi\nline"""\n'),
     "policy-crlf": (POLICY, b'mode = "audit"\r\n[[rule]]\r\nname = "a"\r\nmatch = "drop"'),
 
@@ -146,6 +202,11 @@ tables = ["scratch"]
     "srv-garbage": (SRVSCAN, bytes([0b00000001]) + msg(b"Z", b"I") + b"D\0\0\0\1" + msg(b"Z", b"T")),
     "confirm-delete-rows": (CONFIRM, bytes([0b00000000]) + b"\0\0" + b"\1\x0a" + b"\0\2\0id\0" + b"\1\2" + b"AB" + b"\0\0" + b"\4\3" + b"\0\0\0"),
     "confirm-error": (CONFIRM, bytes([0b00000001]) + b"\3\x30" + b"SERROR\0\0" + b"\4\1I"),
+    "confirm-ext-yes": (CONFIRM, bytes([0b01000000]) + b"\3\x20" + b"\0\2\0id\0" + b"\1\2" + b"AB" + b"\4\3" + b"\0\0\0"),
+    "ext-state-ops": (EXTSTATE, bytes([0, 1, 2, 1, 5, 0, 5, 4, 5, 8, 7, 8, 7, 12, 8, 16, 9, 9, 2, 5, 10, 0])),
+    "ext-state-error": (EXTSTATE, bytes([5, 4, 5, 16, 5, 20, 7, 28, 8, 0, 9, 32, 9, 40, 0, 4, 2, 5, 9, 8])),
+    "scan-ext-bind": (SCANNER, scan(0b01000000, msg(b"B", b"p\0s\0" + b"x" * 300) + msg(b"D", b"Ss\0") + msg(b"E", b"p\0\0\0\0\0") + msg(b"S", b""))),
+    "scan-ext-blocked": (SCANNER, scan(0b11000000, msg(b"B", b"\1p\0s\0") + msg(b"E", b"\3p\0\0\0\0\0") + msg(b"S", b""))),
     "sql-deep": (SQL, b"select " + b"(" * 300 + b"1" + b")" * 300),
 
     "sasl-both": (SASL, struct.pack("!I", 10) + b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"),

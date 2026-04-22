@@ -1,0 +1,5 @@
+[[rule]]
+name = "x"
+match = "delete"
+action = "confirm"
+confirm_via = "email"

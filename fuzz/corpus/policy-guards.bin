@@ -1,0 +1,13 @@
+[[rule]]
+name = "a"
+match = "set_session"
+action = "kill"
+[[rule]]
+name = "b"
+match = "dangerous"
+[[rule]]
+name = "c"
+match = "any"
+action = "alert"
+tables = ["t"]
+functions = ["pg_*", "s.f"]

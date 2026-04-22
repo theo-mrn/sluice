@@ -1,0 +1,7 @@
+[[rule]]
+name = "a"
+match = "any"
+action = "limit"
+budget_statements = "100"
+window = "1h"
+max_transaction = "5m"

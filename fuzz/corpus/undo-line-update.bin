@@ -1,0 +1,1 @@
+{"id":"aaaaaaaaaaaaaaaa","kind":"update","table":"t","rows":2,"complete":true,"columns":["a","b"],"data":[["1",null],["x","y"]],"new":[["1","z"],["x",null]]}
