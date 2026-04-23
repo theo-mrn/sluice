@@ -3,7 +3,7 @@
 A small guard proxy for PostgreSQL, written in C. It sits between a client and the database, reads every
 query, decides whether it goes through, and logs it either way.
 
-> **Status: pre-alpha (v0.11).** sluice relays PostgreSQL connections, reads the SQL they carry with the
+> **Status: pre-alpha (v0.27).** sluice relays PostgreSQL connections, reads the SQL they carry with the
 > PostgreSQL parser itself, applies rules to it, logs every verdict as JSON, and can encrypt and verify the
 > hop to the database. In `audit` mode it only says what it would block; in `enforce` mode it blocks. It is
 > tested automatically against fake servers and, with Docker, against a real PostgreSQL 17 (SCRAM login,
@@ -11,6 +11,24 @@ query, decides whether it goes through, and logs it either way.
 > certificate, `psql` with `sslmode=require`). It builds and passes its tests on macOS and Linux (glibc and
 > musl). The connection from the client to sluice is in clear text unless `--listen-tls` is given. See the
 > [roadmap](#roadmap) and the [limits](#limits-today).
+
+## Install
+
+```bash
+# a binary: one file, nothing to install (Linux static, macOS with OpenSSL inside)
+tar -xzf sluice-VERSION-linux-amd64.tar.gz && ./sluice-VERSION-linux-amd64/sluice --version
+
+# an image: about 10 MB, no shell, a user without rights
+docker run --rm ghcr.io/theo-mrn/sluice:VERSION --version
+
+# or from source: OpenSSL 3+, a C compiler, Meson (libpg_query is fetched, pinned by hash)
+meson setup build && meson compile -C build && ./build/sluice --version
+```
+
+Then `sluice --test-policy examples/policies/agent-readonly.toml examples/policies/agent-readonly.tests` shows what a
+policy does without any server, and [`examples/policies/`](examples/policies/) has two to start from. Where to get it, how to
+check it, and how to run it (Docker, a sidecar in Kubernetes, who answers a confirmation): [docs/deploy.md](docs/deploy.md).
+Changes: [CHANGELOG.md](CHANGELOG.md). Security: [SECURITY.md](SECURITY.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## What it is for
 
@@ -111,8 +129,13 @@ it with `MERGE ... USING secret`.
 A rule can also ask a person before a `DELETE` or `UPDATE` becomes final (`action = "confirm"`): sluice runs
 the statement inside a transaction it does not commit, then shows on the terminal how many rows it touched
 and which, and waits for a `y`. Without an answer (or a terminal), nothing is committed. See
-[docs/policy.md](docs/policy.md#confirming-a-delete-or-update); it needs the simple query protocol (psql, scripts,
-several drivers) for now, and refuses what it cannot confirm instead of letting it through.
+[docs/policy.md](docs/policy.md#confirming-a-delete-or-update). It works with `psql` and scripts (simple queries)
+and with drivers and ORMs that prepare their statements (the extended protocol, asked about at each `Execute`),
+and refuses what it cannot confirm instead of letting it through. **The person who sent the statement is asked,
+in their own session** (an error that shows the rows, then you type `yes;`, `no;` or `show;` for more rows),
+because nobody is usually at the proxy. The question can also be put to a terminal (`--confirm-tty`) or, with
+`--confirm-command`, to any program (a chat bot, a ticket) that an agent cannot answer for itself: its exit
+status is the answer.
 
 To leave the application alone and watch only people, scripts and agents, write the rules with
 `except_users = ["app"]` (everybody but the application): see
@@ -224,10 +247,13 @@ So that nothing surprises you:
   be encrypted: sluice never asks for a passphrase, and a key that needs one stops it at startup. These two
   files are the certificate of **sluice**, not of the clients, who still authenticate to the database in the usual
   way through it. The files are read once at startup (a `SIGHUP` does not reload them).
-- **Confirmations** (`action = "confirm"`) work with the simple query protocol only: a prepared statement
-  (what most ORMs send) or a message with several statements that matches such a rule is refused, with the
-  reason in the error. The rows stay locked while the person decides, rows removed by a cascade in other tables
-  are not listed, and a trigger that acts outside the database has acted even if the answer is no.
+- **Confirmations** (`action = "confirm"`) cover simple queries and prepared statements. A message with several
+  statements or a data-changing CTE that matches such a rule is refused, with the reason in the error; so is an
+  `Execute` with a row limit. A no inside a transaction of the client aborts that transaction for a prepared
+  statement (it stays usable for a simple query). The rows stay locked while the person decides, and a trigger
+  that acts outside the database has acted even if the answer is no. What a statement changed in other tables
+  (cascades, triggers) is shown from the statistics of the transaction; a server that does not have them needs
+  `side_effects = "off"` in the rule.
 - **Messages sluice cannot read** (syntax error, over 1 MiB, malformed, fast-path function call, and a quote
   after a backslash inside a string, which the server may read differently once a session changes
   `standard_conforming_strings` or `client_encoding`) are blocked in `enforce` mode unless the policy says
@@ -347,18 +373,54 @@ independent model with the stream cut in every way), with checks of invariants a
   Simple query protocol only for now.
 - **v0.11** (done): TLS towards the clients (`--listen-tls self-signed`, or `--listen-tls-cert` and
   `--listen-tls-key`), so that `sslmode=require` works and sluice can listen beyond the machine.
+- **v0.12** (done): confirmations for prepared statements (the extended protocol: `Parse`, `Bind`, `Execute`),
+  tested against the real server and against `pgbench -M prepared`.
+- **v0.13** (done): the question also shows what the statement changed besides its own rows (cascades, triggers,
+  as exact counts), and can be put to a command instead of a terminal (`--confirm-command`).
+- **v0.27** (done): `--admin` (an HTTP listener: `/metrics` for Prometheus, `/healthz`, `/pending`), `--confirm-admin` (answer a
+  confirmation with a `POST`, from a bot or a chat), `--event-command` (a command run for the events that matter, with `tools/webhook.sh`
+  for Slack, Mattermost, Discord or any URL).
+- **v0.26** (done): `dry_run` (a rule that says what it would do), `--test-policy` (expectations as a file), `during` / `except_during` /
+  `valid_from` / `valid_until` (a rule that begins and ends by itself), query shapes (`outside_fingerprints`, `sluice --learn`),
+  `budget_statements`, `max_transaction`, `--tag-application-name`, lists over several lines in the policy.
+- **v0.25** (done): `match = "set_session"` (SET ROLE, set_config) and `"dangerous"` (COPY to files or programs, functions that reach out),
+  a `functions` key, `action = "alert"` and `"kill"`, and `--log-chain-key-file` with `sluice --verify-log` (a log that shows when it was changed).
+- **v0.24** (done): mask names may be qualified (`users.email`, `public.users.email`): sluice reads the tables' OIDs once after the login
+  and hides a column only when its rows come from that table; anything it cannot tell is hidden.
+- **v0.23** (done): `journal` also goes with `match = "update"` on PostgreSQL 18 (`RETURNING OLD.*, NEW.*`): `sluice --undo` prints a
+  script that puts the old values back where the row still has the values the UPDATE gave it, and stops if it does not.
+- **v0.22** (done): `journal` on a rule keeps the rows a confirmed `DELETE` removes (`--undo-journal FILE`, written before the
+  `COMMIT`; `required` does not apply a DELETE that cannot be recorded), and `sluice --undo` prints the SQL that puts them back.
+- **v0.21** (done): `MERGE` and `INSERT ... ON CONFLICT DO UPDATE` count as DELETEs and UPDATEs for the rules (they did
+  not), and can be confirmed like them.
+- **v0.20** (done): `action = "mask"` hides values in what a user reads: by column name and by pattern (e-mail, card
+  number, IBAN), as a stable token, partly, NULL or `[masked]`; in both protocols, in error messages and in confirmations.
+  A guard-rail, not a security boundary (see docs/policy.md).
+- **v0.19** (done): a rule says who is asked (`confirm_via = "session"` or `"operator"`), and a **budget** bounds
+  what one user takes out or changes over a window of time whatever the number of connections (`budget_rows`,
+  `budget_bytes`, `budget_changed`, `window`).
+- **v0.18** (done): a transaction left open is ended (`max_idle_in_transaction`), connections per user are
+  bounded (`max_connections`), `--log-results` writes how each statement ended (tag, rows, bytes, time, error code);
+  tests that throw garbage at the proxy, compare it with a direct connection, and run 64 clients at once.
+- **v0.17** (done): limits on a connection (`action = "limit"` with `max_result_rows`, `max_result_bytes`,
+  `max_total_bytes`, `max_duration`): rows past the limit are dropped and the result ends in an error, a connection
+  that has received too much is closed, a statement that runs too long is cancelled on the server.
+- **v0.16** (done): `action = "limit"` (an unattended row cap: more than `max_rows` rows is undone, with the reason)
+  and `sluice --check-policy` (what a policy does with given statements, without a server; usable in a CI).
+- **v0.15** (done): `TRUNCATE` and `DROP` of tables, views and indexes can be confirmed too; the confirmation was
+  tried with psycopg, asyncpg, SQLAlchemy and JDBC (`tests/drivers.py`), which found and fixed two defects (a driver's
+  `ROLLBACK` while a statement waits, and the row limit pgjdbc sends).
+- **v0.14** (done): the question is asked in the client's own session by default (you answer `yes;` or `no;`),
+  for simple queries and prepared statements; a terminal or a command is for an operator who wants it elsewhere.
 - **Later**: that real-PostgreSQL test in a CI, row-count and duration limits.
 
 ## Third-party code
 
-sluice is MIT. It builds [libpg_query](https://github.com/pganalyze/libpg_query) (BSD-3-Clause), which
-embeds the PostgreSQL parser and three small libraries. Their licenses travel with the source tree that
-Meson downloads into `subprojects/libpg_query-18.1.0/`: `LICENSE` (libpg_query), `src/postgres/COPYRIGHT`
-(the PostgreSQL parser), `vendor/upb/LICENSE` and `vendor/upb/third_party/utf8_range/LICENSE` (upb and its
-UTF-8 validator), and the notice in the header of `vendor/xxhash/xxhash.c` (xxHash, BSD 2-Clause). The
-`.wrap` file and the Meson build description are all that is kept in this repository.
-
-It links against the OpenSSL of the system; OpenSSL is not bundled.
+sluice is MIT. It builds [libpg_query](https://github.com/pganalyze/libpg_query) (BSD-3-Clause), which embeds the
+PostgreSQL parser (PostgreSQL License) and three small libraries (upb, utf8_range, xxHash). A binary built with
+`-Dstatic=true` (the release binaries and the images) also holds OpenSSL (Apache-2.0); a dynamic one links to the
+OpenSSL of the system. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) has every licence in full and travels with every
+archive. The `.wrap` file and the Meson build description are all that is kept of libpg_query in this repository.
 
 ## License
 

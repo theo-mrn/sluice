@@ -41,7 +41,11 @@ slows the other one down instead of filling memory.
 | `scanner.c` | Walks the client's bytes message by message and decides what may be sent; pure, driven by callbacks | pg_proto, buf |
 | `srvscan.c` | Walks the server's bytes message by message: relays, reads or throws away each one; pure, driven by callbacks | pg_proto, buf |
 | `confirm.c` | The state machine of one confirmation (a DELETE or UPDATE run in a transaction not yet committed, shown, then committed or rolled back). Messages in, messages out; no socket, no terminal | pg_proto, srvscan, buf |
-| `prompt.c` | A yes / no question on a terminal (`/dev/tty` or `--confirm-tty`), one at a time, in a queue | |
+| `prompt.c` | A yes / no question on a terminal (`/dev/tty` or `--confirm-tty`) or put to a command (`--confirm-command`), one at a time, in a queue | |
+| `extstate.c` | What the extended protocol needs remembered: the guarded statements and portals by name, and the queue of answers the server owes | none |
+| `journal.c`, `undo.c` | The journal of the rows a DELETE removed (one JSON line each, written before the COMMIT and made durable) and the reader that prints the SQL that puts them back (`sluice --undo`). No socket | pg_proto, buf, json |
+| `mask.c` | Hides values in the rows and error messages that go to a client: by column name, and by pattern (e-mail, card with Luhn, IBAN with mod 97) found by hand-written linear scans; HMAC tokens from OpenSSL. Messages in, messages out; no socket | pg_proto, buf |
+| `budget.c` | How much each user has taken out or changed over a sliding window (twelve slices), per rule, shared by their connections; the caller gives the time. No socket | none |
 | `tls.c` | TLS towards the upstream, and as a server towards the clients (certificate files or one made at startup): a thin wrapper of OpenSSL with non-blocking calls that say what they wait for | OpenSSL |
 | `buf.c` | Growable byte queue | |
 | `json.c` | JSON string escaping, valid UTF-8 guaranteed | buf |
