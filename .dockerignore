@@ -1,0 +1,9 @@
+build
+build-asan
+build-*
+.git
+subprojects/packagecache
+subprojects/libpg_query-*/
+*.o
+dist
+out
