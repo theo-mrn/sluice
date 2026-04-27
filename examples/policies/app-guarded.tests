@@ -1,0 +1,14 @@
+as app
+allow :: select * from orders where id = 1
+# held: it is run first, and asked about only above 1000 rows
+confirm confirm-big-updates :: update orders set status = 'paid' where id = 1
+allow :: insert into orders (customer_id) values (1)
+deny no-unbounded-write :: update orders set status = 'paid'
+deny no-unbounded-write :: delete from orders
+deny no-ddl :: drop table orders
+deny no-ddl :: alter table orders add column x int
+confirm confirm-big-deletes :: delete from orders where status = 'old'
+confirm confirm-big-updates :: update orders set status = 'x' where created < now()
+dry try-no-truncate :: truncate orders
+as migrator
+allow :: alter table orders add column x int

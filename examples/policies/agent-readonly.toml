@@ -1,0 +1,69 @@
+# An AI agent (or any tool you do not fully trust) that may look at the data and change nothing.
+#
+#   sluice --listen 127.0.0.1:5433 --upstream db.internal:5432 --policy agent-readonly.toml \
+#          --mask-key-file /etc/sluice/mask.key
+#   DATABASE_URL=postgres://agent@127.0.0.1:5433/mydb
+#
+# Try it before you trust it:  sluice --test-policy agent-readonly.toml agent-readonly.tests
+mode = "enforce"
+
+# The first rules win: these two come before the general one so that they are what is said (and what ends the session).
+# It may not become another role, and may not reach out of the database (files of the server, other
+# servers, sleeping, stopping other sessions): the session is ended, and the log says so.
+[[rule]]
+name    = "no-escalation"
+match   = "set_session"
+users   = ["agent"]
+message = "the role stays what it logged in as"
+
+[[rule]]
+name    = "no-reaching-out"
+match   = "dangerous"
+action  = "kill"
+users   = ["agent"]
+
+# Nothing that is not a read: no INSERT, UPDATE, DELETE, DDL, COPY, SET of anything that matters.
+[[rule]]
+name    = "read-only"
+match   = "not_read_only"
+users   = ["agent"]
+message = "this account can read, not change"
+
+# A table nobody should read: if the agent does, you are told (see the event command in docs/policy.md).
+[[rule]]
+name   = "honeypot"
+match  = "any"
+action = "alert"
+users  = ["agent"]
+tables = ["internal_secrets"]
+
+# What it takes out is bounded: a result, a connection, and a window of time.
+[[rule]]
+name              = "agent-limits"
+match             = "any"
+action            = "limit"
+users             = ["agent"]
+max_result_rows   = "10000"
+max_result_bytes  = "20MB"
+max_duration      = "30s"
+max_transaction   = "5m"
+max_connections   = "4"
+
+[[rule]]
+name         = "agent-budget"
+match        = "any"
+action       = "limit"
+users        = ["agent"]
+budget_rows  = "200000"
+budget_statements = "5000"
+window       = "1h"
+
+# Personal data is hidden in what it reads (a guard-rail, not a boundary: see docs/policy.md).
+[[rule]]
+name    = "hide-personal-data"
+match   = "any"
+action  = "mask"
+users   = ["agent"]
+columns = ["email", "phone", "users.ssn"]
+detect  = ["email", "card", "iban"]
+how     = "hash"

@@ -1,0 +1,56 @@
+# An application's database account, guarded against the mistakes that hurt: a write without WHERE, a schema change
+# outside a migration, a big DELETE or UPDATE nobody looked at. It starts in `audit` mode: it only says what it
+# WOULD refuse, so that you can read the log before anything is refused (change `mode` when you have).
+#
+#   sluice --listen 0.0.0.0:5433 --upstream db.internal:5432 --policy app-guarded.toml \
+#          --undo-journal /var/lib/sluice/undo.jsonl
+#
+# `journal` keeps the rows a confirmed DELETE removes, so that `sluice --undo` can print the SQL that puts them back.
+mode = "audit"
+confirm_timeout = "2m"
+
+# A migration may change the schema, on the days it is announced.
+[[rule]]
+name        = "migrations"
+match       = "ddl"
+action      = "allow"
+users       = ["migrator"]
+
+[[rule]]
+name    = "no-ddl"
+match   = "ddl"
+message = "schema changes go through a migration"
+
+[[rule]]
+name    = "no-unbounded-write"
+match   = "update_or_delete_without_where"
+message = "add a WHERE clause"
+
+# More than 100 rows deleted or updated: somebody is asked, with the rows and what else it touches (cascades, triggers).
+[[rule]]
+name      = "confirm-big-deletes"
+match     = "delete"
+action    = "confirm"
+over_rows = "100"
+journal   = "required"
+
+[[rule]]
+name      = "confirm-big-updates"
+match     = "update"
+action    = "confirm"
+over_rows = "1000"
+
+# A rule you are trying: it says what it would do and decides nothing. Read `dry_run` events, then remove the line.
+[[rule]]
+name    = "try-no-truncate"
+match   = "truncate"
+dry_run = "on"
+
+# Connections that stay open in a transaction hold locks.
+[[rule]]
+name                    = "app-limits"
+match                   = "any"
+action                  = "limit"
+users                   = ["app"]
+max_idle_in_transaction = "2m"
+max_transaction         = "10m"

@@ -1,0 +1,18 @@
+as agent
+allow :: select id, name from customers where id = 1
+allow :: select count(*) from orders
+allow :: set application_name = 'agent'
+allow :: explain select * from orders
+deny read-only :: update customers set name = 'x' where id = 1
+deny read-only :: delete from orders where id = 1
+deny read-only :: insert into orders values (1)
+deny read-only :: create table t (a int)
+deny read-only :: truncate orders
+deny no-escalation :: set role postgres
+deny no-escalation :: select set_config('role', 'postgres', false)
+kill no-reaching-out :: select pg_read_file('/etc/passwd')
+kill no-reaching-out :: copy customers to program 'sh'
+kill no-reaching-out :: select pg_sleep(60)
+alert honeypot :: select * from internal_secrets
+as someone-else
+allow :: update customers set name = 'x' where id = 1
