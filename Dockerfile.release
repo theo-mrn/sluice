@@ -1,0 +1,19 @@
+# The images of a release, made of the static binaries that the release workflow built and tested (bin/linux-amd64/sluice
+# and bin/linux-arm64/sluice), so that nothing is compiled twice and the image holds the very binary that was released.
+# See Dockerfile for what the two images are.
+
+FROM alpine:3.22 AS tools
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates curl openssl tini \
+ && adduser -D -H -u 65532 -s /sbin/nologin sluice
+COPY bin/linux-${TARGETARCH}/sluice /usr/local/bin/sluice
+COPY tools/webhook.sh /usr/share/sluice/webhook.sh
+USER 65532:65532
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/sluice"]
+
+FROM scratch AS runtime
+ARG TARGETARCH
+COPY --from=tools /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY bin/linux-${TARGETARCH}/sluice /sluice
+USER 65532:65532
+ENTRYPOINT ["/sluice"]

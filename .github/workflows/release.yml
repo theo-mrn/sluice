@@ -1,0 +1,230 @@
+# A release: push a tag `vX.Y.Z` (the version of meson.build, with an entry in CHANGELOG.md) and this builds, tests and
+# publishes the binaries, the source archive, the checksums, their provenance, and the container images.
+#
+# Nothing is published from a manual run (workflow_dispatch): it builds everything and keeps it as artifacts, to see
+# that a release would work.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  check:
+    name: the tag matches the version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n "s/^  version : '\(.*\)',/\1/p" meson.build | head -n 1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "the tag ${GITHUB_REF_NAME} is not v$version (meson.build)"; exit 1
+          fi
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "CHANGELOG.md has no entry for $version"; exit 1; }
+
+  linux:
+    name: linux-${{ matrix.arch }} (static, musl)
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test, in Alpine
+        run: docker run --rm -v "$PWD":/src -w /src alpine:3.22 sh tools/build-static.sh "$(git rev-parse --short=9 HEAD)"
+      - name: Package
+        run: sh tools/package.sh "${{ needs.check.outputs.version }}" linux-${{ matrix.arch }} dist/sluice
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-linux-${{ matrix.arch }}
+          path: |
+            out/*.tar.gz
+            dist/sluice
+          if-no-files-found: error
+
+  macos:
+    name: macos-${{ matrix.arch }} (OpenSSL linked in)
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-15 }
+          - { arch: amd64, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          brew install meson ninja pkg-config openssl@3
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "SLUICE_OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+      - name: Build and test
+        run: |
+          meson setup build --buildtype=release -Db_ndebug=true -Dstatic=true -Dcommit="$(git rev-parse --short=9 HEAD)"
+          meson compile -C build sluice
+          strip build/sluice
+          meson test -C build --print-errorlogs
+          otool -L build/sluice
+          # nothing but the system library: OpenSSL is inside
+          test "$(otool -L build/sluice | tail -n +2 | grep -vc '/usr/lib/libSystem')" = 0
+          mkdir -p dist && cp build/sluice dist/sluice
+      - name: Package
+        run: sh tools/package.sh "${{ needs.check.outputs.version }}" macos-${{ matrix.arch }} dist/sluice
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-macos-${{ matrix.arch }}
+          path: |
+            out/*.tar.gz
+            dist/sluice
+          if-no-files-found: error
+
+  source:
+    name: source archive (builds without a network)
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ninja-build pkg-config libssl-dev python3 openssl procps
+      - name: Make the archive, with libpg_query inside
+        run: |
+          meson setup build
+          meson dist -C build --include-subprojects --no-tests
+          mkdir -p out && cp build/meson-dist/sluice-*.tar.xz* out/
+      - name: Build from it, offline
+        run: |
+          mkdir /tmp/from-archive && tar -xf out/sluice-*.tar.xz -C /tmp/from-archive --strip-components=1
+          cd /tmp/from-archive
+          # no download is possible: libpg_query is in the archive
+          meson setup build --wrap-mode=nodownload
+          meson compile -C build sluice
+          ./build/sluice --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    if: github.ref_type == 'tag'
+    needs: [check, linux, macos, source]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Checksums
+        run: |
+          mkdir release
+          cp artifacts/binary-*/out/*.tar.gz artifacts/source/* release/
+          cd release && sha256sum ./* | sed "s|\./||" > SHA256SUMS && cat SHA256SUMS
+      - name: Provenance (who built what, from which commit)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+      - name: Release notes, from the changelog
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          awk -v v="$v" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+          { echo; echo "Verify a download with \`sha256sum -c SHA256SUMS\`, and its provenance with \`gh attestation verify FILE --repo $GITHUB_REPOSITORY\`."; } >> notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* --title "sluice ${GITHUB_REF_NAME#v}" --notes-file notes.md --prerelease
+
+  images:
+    name: container images
+    needs: [check, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-linux-*
+          path: artifacts
+      - name: Put the binaries where the Dockerfile looks
+        run: |
+          for arch in amd64 arm64; do mkdir -p "bin/linux-$arch"; cp "artifacts/binary-linux-$arch/dist/sluice" "bin/linux-$arch/sluice"; done
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@v3
+      - id: meta
+        run: |
+          repo=$(echo "$REGISTRY/$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+      - name: Image with nothing but the binary
+        id: runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ${{ steps.meta.outputs.repo }}:${{ needs.check.outputs.version }}
+            ${{ steps.meta.outputs.repo }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+      - name: Image with curl, openssl and the webhook command
+        id: tools
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          target: tools
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ${{ steps.meta.outputs.repo }}:${{ needs.check.outputs.version }}-tools
+            ${{ steps.meta.outputs.repo }}:tools
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+      - name: Sign the images (keyless, with this workflow's identity)
+        if: github.ref_type == 'tag'
+        run: |
+          cosign sign --yes "${{ steps.meta.outputs.repo }}@${{ steps.runtime.outputs.digest }}"
+          cosign sign --yes "${{ steps.meta.outputs.repo }}@${{ steps.tools.outputs.digest }}"
